@@ -113,6 +113,13 @@ void DescriptorHeap::CreateDescriptorPool() {
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 	m_current_pool_scale = m_pool_scale;
+	// Diagnostic: report at 1, 2, 4, 8, ... creations to show runaway pool churn.
+	static uint32_t created = 0;
+	++created;
+	if ((created & (created - 1u)) == 0u) {
+		std::printf("Descriptor pools created so far: %u (current scale %ux, %zu waiting)\n", created,
+		            m_pool_scale, m_pending_pools.size());
+	}
 }
 
 } // namespace Libs::Graphics

@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <limits>
 #include <span>
 #include <vector>
@@ -197,6 +198,18 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		descriptor_count += binding.descriptorCount;
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	if (descriptor_count > 1024) {
+		// Diagnostic: very large layouts (bindless texture tables) make descriptor pools expensive.
+		std::printf("Large descriptor layout: %u descriptors, push=%d, bindings:", descriptor_count,
+		            pipeline.uses_push_descriptors ? 1 : 0);
+		for (const auto& binding: bindings) {
+			if (binding.descriptorCount > 64) {
+				std::printf(" [b%u %s x%u]", binding.binding,
+				            vk::to_string(binding.descriptorType).c_str(), binding.descriptorCount);
+			}
+		}
+		std::printf("\n");
+	}
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
