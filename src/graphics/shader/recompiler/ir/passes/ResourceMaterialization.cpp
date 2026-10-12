@@ -171,6 +171,7 @@ void NullMinorityNumericClasses(std::vector<DescriptorValue>&        descriptors
 		}
 	}
 	if (dominant == ClassCount) return;
+	std::array<uint32_t, ClassCount> dropped {};
 	for (size_t index = 0; index < count; ++index) {
 		if (index == root || specializations[index].indirect_root != root ||
 		    NullImageDescriptor(descriptors[index])) {
@@ -180,7 +181,17 @@ void NullMinorityNumericClasses(std::vector<DescriptorValue>&        descriptors
 		if (numeric_class != dominant && numeric_class < ClassCount &&
 		    numeric_class != static_cast<size_t>(Prospero::TextureNumericClass::Unsupported)) {
 			descriptors[index].dwords.fill(0u);
+			++dropped[numeric_class];
 		}
+	}
+	// Diagnostic for black-screen reports: shows when textures of a minority class were dropped.
+	// Classes: 1 = Float, 2 = Uint, 3 = Sint. Capped so per-draw materialization cannot flood.
+	static uint32_t reports = 0;
+	if (reports < 16u && (dropped[1] | dropped[2] | dropped[3]) != 0u) {
+		++reports;
+		std::printf("Indirect image table: kept class %zu (%u textures), dropped float=%u uint=%u "
+		            "sint=%u\n",
+		            dominant, votes[dominant], dropped[1], dropped[2], dropped[3]);
 	}
 }
 
