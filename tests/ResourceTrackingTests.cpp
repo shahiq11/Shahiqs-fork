@@ -388,6 +388,57 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed image table tracking was not transactional");
 }
 
+// With on-demand residency, a broad heap materializes its first texture (so the table keeps its
+// type) and otherwise only slots that shader feedback reported as read.
+void TestBroadHeapResidency() {
+  ImageResidency::SetEnabled(true);
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, true);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  std::array<uint32_t, 16> data{0x3000u, 16u << 16u, 0x200000u, 0u,
+                                0x2000u, 48u << 16u, 3u, 0u};
+  std::copy_n(data.begin(), 4u, data.begin() + 12u);
+  LinearTestMemory memory;
+  memory.fail_address = 0x3000u;
+  const auto put = [&](uint32_t offset, uint32_t identity) {
+    auto value = descriptor;
+    value[0] += identity;
+    std::copy(value.begin(), value.end(), memory.words.begin() + (0x1000u + offset) / 4u);
+  };
+  put(16u, 0u);
+  put(64u, 1u);
+  SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u + BroadHeapGroupCapacity,
+        "on-demand heap did not keep its first texture");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(mapping >= ImageResidencyHeaderWords && snapshot.flattened_srt[mapping - 1u] == 36u &&
+            snapshot.flattened_srt[mapping + 5u] == 1u &&
+            snapshot.flattened_srt[mapping + 17u] == 0u,
+        "on-demand heap materialized an unrequested texture or lost its feedback header");
+  const auto base = snapshot.flattened_srt[mapping - 2u];
+  std::vector<uint32_t> feedback(ImageResidency::FeedbackWords(), 0u);
+  const auto bit = base + 16u;
+  Check(bit / 32u < feedback.size(), "feedback area does not cover the heap");
+  feedback[bit / 32u] |= 1u << (bit % 32u);
+  ImageResidency::MarkUsed(feedback);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt[mapping + 17u] == 2u &&
+            snapshot.images[2].dwords[0] == descriptor[0] + 1u,
+        "reported heap slot was not materialized");
+  ImageResidency::SetEnabled(false);
+}
+
 void TestBoundedImageViewEligibility() {
   using Type = Libs::Graphics::Prospero::ImageType;
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
@@ -3728,6 +3779,7 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("broad heap residency", TestBroadHeapResidency);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
