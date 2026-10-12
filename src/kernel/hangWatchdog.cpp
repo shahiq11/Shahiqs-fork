@@ -172,14 +172,15 @@ std::string DescribeGuestAddress(uint64_t addr) {
 	if (addr == 0) {
 		return "0";
 	}
-	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-	if (auto* program = rt->FindProgramByAddr(addr); program != nullptr) {
+	auto* rt   = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	bool  busy = false;
+	if (auto* program = rt->TryFindProgramByAddr(addr, &busy); program != nullptr) {
 		return fmt::format("{}+0x{:x}",
 		                   Common::FilenameWithoutDirectory(
 		                       Common::PathToGenericString(program->file_name)),
 		                   addr - program->base_vaddr);
 	}
-	return fmt::format("0x{:016x}", addr);
+	return fmt::format("0x{:016x}{}", addr, busy ? " (linker busy)" : "");
 }
 
 void ReportBlockedWaits(std::string& out, int64_t now) {
@@ -609,14 +610,19 @@ void WatchdogThread() {
 		    "\n=== Kyty hang watchdog report #{}: no frame progress for {:.1f} s (progress "
 		    "counter {}) ===\n",
 		    total_reports, static_cast<double>(stalled) / 1e9, progress);
+		// Write each section as soon as it is ready, so a section that gets stuck cannot hide
+		// the ones before it.
 		ReportBlockedWaits(report, now);
+		WriteReport(report);
 		{
 			std::lock_guard lock(g_reporters_mutex);
 			for (auto& [name, reporter]: g_reporters) {
-				report += fmt::format("--- {} ---\n", name);
+				report = fmt::format("--- {} ---\n", name);
 				reporter(report);
+				WriteReport(report);
 			}
 		}
+		report.clear();
 		ReportThreadSamples(report);
 		report += "=== end of hang report ===\n";
 		WriteReport(report);

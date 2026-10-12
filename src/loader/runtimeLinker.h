@@ -175,6 +175,8 @@ public:
 
 	static uint64_t ReadFromElf(Program* program, uint64_t vaddr);
 	Program*        FindProgramByAddr(uint64_t vaddr);
+	// Like FindProgramByAddr, but returns nullptr instead of waiting if the linker is busy.
+	Program*        TryFindProgramByAddr(uint64_t vaddr, bool* busy);
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
 

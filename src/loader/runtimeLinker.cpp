@@ -23,6 +23,8 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
+#include <chrono>
+#include <thread>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -1484,10 +1486,29 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	return nullptr;
 }
 
+static Program* FindProgramByAddrLocked(const std::vector<Program*>& programs, uint64_t vaddr);
+
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	Common::LockGuard lock(m_mutex);
+	return FindProgramByAddrLocked(m_programs, vaddr);
+}
 
-	for (auto* p: m_programs) {
+Program* RuntimeLinker::TryFindProgramByAddr(uint64_t vaddr, bool* busy) {
+	for (int attempt = 0; attempt < 50; attempt++) {
+		if (m_mutex.TryLock()) {
+			auto* program = FindProgramByAddrLocked(m_programs, vaddr);
+			m_mutex.Unlock();
+			*busy = false;
+			return program;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	*busy = true;
+	return nullptr;
+}
+
+static Program* FindProgramByAddrLocked(const std::vector<Program*>& programs, uint64_t vaddr) {
+	for (auto* p: programs) {
 		const auto* ehdr = p->elf->GetEhdr();
 		const auto* phdr = p->elf->GetPhdr();
 
