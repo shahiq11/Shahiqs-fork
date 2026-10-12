@@ -154,6 +154,26 @@ void DumpBigShader(const char* kind, const char* stage_name, uint64_t shader_has
 	}
 }
 
+// Diagnostics: keep every guest shader binary in _Shaders (once per hash, a few KB each) so a
+// shader that stops the emulator can be analyzed offline.
+void KeepGuestShader(const char* stage_name, uint64_t shader_hash, std::span<const uint32_t> code) {
+	static std::mutex                      mutex;
+	static std::unordered_set<uint64_t>    written;
+	{
+		std::lock_guard lock(mutex);
+		if (code.empty() || written.size() > 65536 || !written.insert(shader_hash).second) return;
+	}
+	const auto path =
+	    std::filesystem::path("_Shaders") / fmt::format("{}_{:016x}.bin", stage_name, shader_hash);
+	std::error_code error;
+	if (std::filesystem::exists(path, error)) return;
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (!file.IsInvalid()) {
+		file.Write(code.data(), static_cast<uint32_t>(code.size_bytes()));
+	}
+}
+
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -485,6 +505,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		KeepGuestShader(stage_name, options.shader_hash, params.code);
 		Kernel::HangWatchdog::Activity watch_shader("shader translate", options.shader_hash,
 		                                            static_cast<uint64_t>(stage));
 		ShaderRecompiler::ShaderSource source;

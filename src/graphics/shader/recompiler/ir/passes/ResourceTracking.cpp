@@ -8,10 +8,15 @@
 #include <algorithm>
 #include <bit>
 #include <fmt/format.h>
+#include <array>
+#include <cstdio>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -2268,6 +2273,55 @@ private:
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
+			}
+			// Descriptor DWORDs loaded directly from memory.
+			const auto loaded = [](Value word) {
+				word = word.Resolve();
+				const auto* inst = word.TryInstruction();
+				if (inst == nullptr) return word.IsImmediate();
+				switch (inst->GetOpcode()) {
+					case ValueOpcode::LoadAddressU32:
+					case ValueOpcode::ReadConstBuffer: return true;
+					case ValueOpcode::CompositeExtractU32x4: {
+						const auto* load = inst->Arg(0).Resolve().TryInstruction();
+						return load != nullptr && load->GetOpcode() == ValueOpcode::LoadBufferU32x4;
+					}
+					default: return false;
+				}
+			};
+			bool heap_sampler = expected == ValueOpcode::GetSamplerResource && width == 4u &&
+			                    handle->NumArgs() == 4u;
+			bool any_loaded = false;
+			for (uint32_t i = 0; heap_sampler && i < 4u; ++i) {
+				heap_sampler = loaded(handle->Arg(i));
+				any_loaded |= !handle->Arg(i).Resolve().IsImmediate();
+			}
+			if (heap_sampler && any_loaded) {
+				// The S# comes from a GPU-selected sampler heap that the host cannot enumerate.
+				// Sample with a common sampler (wrap, trilinear) instead of stopping the game.
+				static constexpr std::array<uint32_t, 4> DefaultSampler {
+				    0u, 0xfffu << 12u, (1u << 20u) | (1u << 22u) | (2u << 26u), 0u};
+				descriptor = {};
+				descriptor.dword_count = 4u;
+				for (uint32_t i = 0; i < 4u; ++i) {
+					descriptor.dwords[i] = Value(DefaultSampler[i]);
+					handle->SetArg(i, Value(DefaultSampler[i]));
+				}
+				for (auto& entry: m_resolved_handles) {
+					if (entry.handle == handle) entry.source = descriptor;
+				}
+				static std::mutex                   mutex;
+				static std::unordered_set<uint64_t> warned;
+				{
+					std::scoped_lock lock(mutex);
+					if (warned.size() < 1024 && warned.insert(m_program.shader_hash).second) {
+						std::printf("Note: shader %016llx pc=0x%08x selects its sampler on the GPU; "
+						            "using a default trilinear wrap sampler\n",
+						            static_cast<unsigned long long>(m_program.shader_hash), pc);
+					}
+				}
+				source = InternSource(descriptor);
+				return true;
 			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
