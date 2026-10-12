@@ -88,6 +88,19 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	EXIT("invalid native descriptor binding kind");
 }
 
+// Broad texture tables pad their groups with thousands of identical null descriptors. Adjacent
+// image slots with the same descriptor and binding shape resolve to the same binding, so the
+// per-draw/dispatch work for them is copied instead of repeated.
+static bool SameImageBindingShape(const ShaderRecompiler::IR::ImageResource& a,
+                                  const ShaderRecompiler::IR::ImageResource& b) {
+	return a.resource_class == b.resource_class && a.numeric_class == b.numeric_class &&
+	       a.dimension == b.dimension && a.mip_mode == b.mip_mode && a.mip_count == b.mip_count &&
+	       a.conversion_format == b.conversion_format && a.shader_swizzle == b.shader_swizzle &&
+	       a.read == b.read && a.written == b.written && a.atomic == b.atomic &&
+	       a.atomic64 == b.atomic64 && a.depth_compare == b.depth_compare && a.cube == b.cube &&
+	       a.r128 == b.r128;
+}
+
 vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t element) {
 	vk::ImageView view = nullptr;
 	if (texture.mip_views.empty()) {
@@ -740,6 +753,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (i > 0 && snapshot.images[i] == snapshot.images[i - 1] &&
+		    SameImageBindingShape(program.info.images[i], program.info.images[i - 1])) {
+			prepared.images[i] = prepared.images[i - 1];
+			continue;
+		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
@@ -854,6 +872,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (i > 0 && snapshot.images[i] == snapshot.images[i - 1] &&
+		    SameImageBindingShape(program.info.images[i], program.info.images[i - 1])) {
+			images[i] = images[i - 1];
+			continue;
+		}
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
@@ -1017,8 +1040,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
+			if (i > 0 && binding.image_id == descriptors.images[i - 1].image_id &&
+			    binding.image_view == descriptors.images[i - 1].image_view &&
+			    binding.mip_views == descriptors.images[i - 1].mip_views &&
+			    binding.desc.type == descriptors.images[i - 1].desc.type) {
+				binding.layout = descriptors.images[i - 1].layout;
+				continue;
+			}
+			auto& image   = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
