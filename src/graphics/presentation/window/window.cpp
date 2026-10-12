@@ -1,4 +1,5 @@
 #include "graphics/presentation/window.h"
+#include "kernel/hangWatchdog.h"
 
 #include <SDL3/SDL.h>
 
@@ -852,6 +853,7 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 
 void WindowRun() {
 	KYTY_PROFILER_THREAD("Thread_Window");
+	Kernel::HangWatchdog::SetCurrentThreadName("Kyty main/window");
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();

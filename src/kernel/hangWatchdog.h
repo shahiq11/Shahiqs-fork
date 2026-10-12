@@ -28,6 +28,19 @@ private:
 	bool m_outer = false;
 };
 
+// Marks what the current thread is busy doing (not waiting), for example compiling a shader.
+// Scopes nest; reports show the whole stack of activities and how long each has run.
+class Activity final {
+public:
+	explicit Activity(const char* what, uint64_t arg0 = 0, uint64_t arg1 = 0) noexcept;
+	~Activity();
+	Activity(const Activity&)            = delete;
+	Activity& operator=(const Activity&) = delete;
+
+private:
+	bool m_pushed = false;
+};
+
 // Records the current thread's guest name so reports can show it.
 void SetCurrentThreadName(const char* name) noexcept;
 

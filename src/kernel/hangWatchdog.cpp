@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -24,6 +25,7 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
 #include <dbghelp.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 #else
 #include <pthread.h>
@@ -50,6 +52,16 @@ struct Slot {
 	uint64_t              caller = 0;
 	char                  name[48] {};
 	char                  thread_name[32] {};
+
+	struct ActivityEntry {
+		const char*          what = nullptr; // string literal
+		uint64_t             arg0 = 0;
+		uint64_t             arg1 = 0;
+		std::atomic<int64_t> start_ns {0};
+	};
+	static constexpr uint32_t            MaxActivities = 8;
+	std::array<ActivityEntry, MaxActivities> activities {};
+	std::atomic_uint32_t                 activity_depth {0};
 };
 
 std::array<Slot, MaxSlots> g_slots;
@@ -131,6 +143,32 @@ WaitScope::~WaitScope() {
 	t_depth--;
 	if (m_outer && t_slot != nullptr) {
 		t_slot->start_ns.store(0, std::memory_order_release);
+	}
+}
+
+Activity::Activity(const char* what, uint64_t arg0, uint64_t arg1) noexcept {
+	auto* slot = CurrentSlot();
+	if (slot == nullptr) {
+		return;
+	}
+	const auto depth = slot->activity_depth.load(std::memory_order_relaxed);
+	m_pushed         = true;
+	if (depth < Slot::MaxActivities) {
+		auto& entry = slot->activities[depth];
+		entry.what  = what;
+		entry.arg0  = arg0;
+		entry.arg1  = arg1;
+		entry.start_ns.store(NowNs() | 1, std::memory_order_relaxed);
+	}
+	slot->activity_depth.store(depth + 1, std::memory_order_release);
+}
+
+Activity::~Activity() {
+	if (m_pushed && t_slot != nullptr) {
+		const auto depth = t_slot->activity_depth.load(std::memory_order_relaxed);
+		if (depth != 0) {
+			t_slot->activity_depth.store(depth - 1, std::memory_order_release);
+		}
 	}
 }
 
@@ -231,6 +269,41 @@ void ReportBlockedWaits(std::string& out, int64_t now) {
 	}
 }
 
+// Threads that have been inside the same marked activity (shader compile, GPU packet, ...) for a
+// long time: these are busy, not waiting.
+void ReportLongActivities(std::string& out, int64_t now) {
+	std::string rows;
+	uint32_t    found = 0;
+	const auto  count = std::min(g_slot_count.load(std::memory_order_relaxed), MaxSlots);
+	for (uint32_t i = 0; i < count; i++) {
+		const auto& slot  = g_slots[i];
+		const auto  depth = std::min(slot.activity_depth.load(std::memory_order_acquire),
+		                             Slot::MaxActivities);
+		if (depth == 0) {
+			continue;
+		}
+		const auto outer_start = slot.activities[0].start_ns.load(std::memory_order_relaxed);
+		if (outer_start == 0 || now - outer_start < MinBlockedWaitNs) {
+			continue;
+		}
+		char thread_name[sizeof(slot.thread_name)];
+		std::memcpy(thread_name, slot.thread_name, sizeof(thread_name));
+		thread_name[sizeof(thread_name) - 1] = 0;
+		found++;
+		rows += fmt::format("  tid={} thread=\"{}\"\n", slot.host_tid.load(), thread_name);
+		for (uint32_t d = 0; d < depth; d++) {
+			const auto& e     = slot.activities[d];
+			const auto  start = e.start_ns.load(std::memory_order_relaxed);
+			rows += fmt::format("    [{}] {:7.1f}s in {:<28} arg0=0x{:x} arg1=0x{:x}\n", d,
+			                    static_cast<double>(now - start) / 1e9,
+			                    (e.what != nullptr ? e.what : "?"), e.arg0, e.arg1);
+		}
+	}
+	out += fmt::format("Long-running activities (older than {} s): {}\n",
+	                   MinBlockedWaitNs / 1000000000, found);
+	out += rows;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 struct ModuleRange {
@@ -239,25 +312,29 @@ struct ModuleRange {
 	std::string name;
 };
 
+// Uses only the loader's module list (no Toolhelp snapshot, which can block).
 std::vector<ModuleRange> HostModules() {
 	std::vector<ModuleRange> modules;
-	HANDLE                   snapshot =
-	    CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-	if (snapshot == INVALID_HANDLE_VALUE) {
+	std::vector<HMODULE>     handles(1024);
+	DWORD                    needed = 0;
+	if (K32EnumProcessModules(GetCurrentProcess(), handles.data(),
+	                          static_cast<DWORD>(handles.size() * sizeof(HMODULE)), &needed) == 0) {
 		return modules;
 	}
-	MODULEENTRY32W entry {};
-	entry.dwSize = sizeof(entry);
-	for (BOOL ok = Module32FirstW(snapshot, &entry); ok; ok = Module32NextW(snapshot, &entry)) {
-		ModuleRange range;
-		range.begin = reinterpret_cast<uint64_t>(entry.modBaseAddr);
-		range.end   = range.begin + entry.modBaseSize;
-		for (const wchar_t* p = entry.szModule; *p != 0; p++) {
-			range.name.push_back(*p < 128 ? static_cast<char>(*p) : '?');
+	handles.resize(std::min<size_t>(handles.size(), needed / sizeof(HMODULE)));
+	for (auto* handle: handles) {
+		MODULEINFO info {};
+		if (K32GetModuleInformation(GetCurrentProcess(), handle, &info, sizeof(info)) == 0) {
+			continue;
 		}
+		char name[MAX_PATH] {};
+		K32GetModuleBaseNameA(GetCurrentProcess(), handle, name, MAX_PATH);
+		ModuleRange range;
+		range.begin = reinterpret_cast<uint64_t>(info.lpBaseOfDll);
+		range.end   = range.begin + info.SizeOfImage;
+		range.name  = name;
 		modules.push_back(std::move(range));
 	}
-	CloseHandle(snapshot);
 	return modules;
 }
 
@@ -268,70 +345,6 @@ const ModuleRange* FindModule(const std::vector<ModuleRange>& modules, uint64_t 
 		}
 	}
 	return nullptr;
-}
-
-bool ReadMemory(uint64_t addr, void* dst, size_t size) {
-	SIZE_T read = 0;
-	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(addr), dst, size,
-	                         &read) != 0 &&
-	       read == size;
-}
-
-// Plain data only: called while the target thread is suspended, so it must not allocate.
-int WalkStack(CONTEXT ctx, uint64_t* frames, int max_frames, const ModuleRange* modules,
-              size_t module_count) {
-	int n = 0;
-	for (int i = 0; i < max_frames; i++) {
-		const uint64_t rip = ctx.Rip;
-		if (rip == 0) {
-			break;
-		}
-		frames[n++] = rip;
-		bool host   = false;
-		for (size_t m = 0; m < module_count; m++) {
-			if (rip >= modules[m].begin && rip < modules[m].end) {
-				host = true;
-				break;
-			}
-		}
-		if (host) {
-			DWORD64 image_base = 0;
-			auto*   function   = RtlLookupFunctionEntry(rip, &image_base, nullptr);
-			if (function != nullptr) {
-				PVOID   handler_data = nullptr;
-				DWORD64 frame        = 0;
-				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, rip, function, &ctx,
-				                 &handler_data, &frame, nullptr);
-			} else {
-				uint64_t ret = 0;
-				if (!ReadMemory(ctx.Rsp, &ret, sizeof(ret))) {
-					break;
-				}
-				ctx.Rip = ret;
-				ctx.Rsp += 8;
-			}
-		} else {
-			// Guest code: follow the frame-pointer chain.
-			const uint64_t fp = ctx.Rbp;
-			uint64_t       saved[2] {};
-			if (fp < ctx.Rsp || fp - ctx.Rsp > (64ull << 20u) || !ReadMemory(fp, saved, 16)) {
-				break;
-			}
-			ctx.Rbp = saved[0];
-			ctx.Rip = saved[1];
-			ctx.Rsp = fp + 16;
-		}
-	}
-	return n;
-}
-
-int WalkStackSafe(const CONTEXT& ctx, uint64_t* frames, int max_frames,
-                  const ModuleRange* modules, size_t module_count) {
-	__try {
-		return WalkStack(ctx, frames, max_frames, modules, module_count);
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		return 0;
-	}
 }
 
 class Symbolizer {
@@ -352,8 +365,19 @@ public:
 		if (init == nullptr || options == nullptr || m_from_addr == nullptr) {
 			return;
 		}
-		options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-		m_ok = init(GetCurrentProcess(), nullptr, TRUE) != 0;
+		options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES |
+		        SYMOPT_NO_PROMPTS | SYMOPT_FAIL_CRITICAL_ERRORS);
+		// Search only next to the executable: never a symbol server.
+		wchar_t exe[MAX_PATH] {};
+		GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		std::string dir;
+		for (const wchar_t* p = exe; *p != 0; p++) {
+			dir.push_back(*p < 128 ? static_cast<char>(*p) : '?');
+		}
+		if (auto pos = dir.find_last_of("\\/"); pos != std::string::npos) {
+			dir.resize(pos);
+		}
+		m_ok = init(GetCurrentProcess(), dir.c_str(), TRUE) != 0;
 	}
 
 	std::string Name(uint64_t addr) {
@@ -371,8 +395,8 @@ public:
 		std::string result = fmt::format("{}+0x{:x}", symbol->Name, displacement);
 		if (m_line != nullptr) {
 			IMAGEHLP_LINE64 line {};
-			line.SizeOfStruct  = sizeof(line);
-			DWORD line_disp    = 0;
+			line.SizeOfStruct = sizeof(line);
+			DWORD line_disp   = 0;
 			if (m_line(GetCurrentProcess(), addr, &line_disp, &line) != 0 &&
 			    line.FileName != nullptr) {
 				result += fmt::format(" [{}:{}]",
@@ -384,16 +408,16 @@ public:
 	}
 
 private:
-	HMODULE                                m_dbghelp   = nullptr;
-	decltype(&SymFromAddr)                 m_from_addr = nullptr;
-	decltype(&SymGetLineFromAddr64)        m_line      = nullptr;
-	bool                                   m_ok        = false;
+	HMODULE                         m_dbghelp   = nullptr;
+	decltype(&SymFromAddr)          m_from_addr = nullptr;
+	decltype(&SymGetLineFromAddr64) m_line      = nullptr;
+	bool                            m_ok        = false;
 };
 
 std::string DescribeAddress(uint64_t addr, const std::vector<ModuleRange>& modules,
-                            Symbolizer& symbolizer) {
+                            Symbolizer* symbolizer) {
 	if (const auto* m = FindModule(modules, addr); m != nullptr) {
-		auto symbol = symbolizer.Name(addr);
+		auto symbol = (symbolizer != nullptr ? symbolizer->Name(addr) : std::string {});
 		return fmt::format("{}+0x{:x}{}{}", m->name, addr - m->begin, symbol.empty() ? "" : " ",
 		                   symbol);
 	}
@@ -432,24 +456,34 @@ uint64_t ThreadCpu100ns(HANDLE thread) {
 	return k + u;
 }
 
+std::atomic<const char*> g_sampler_phase {"not started"};
+
+// While a thread is suspended this only copies registers and raw stack memory; all analysis
+// happens after every thread is resumed, so no lock held by a suspended thread is ever needed.
 void ReportThreadSamples(std::string& out) {
-	constexpr int SampleRounds = 40;
-	constexpr int SampleGapMs  = 50;
-	constexpr int MaxFrames    = 24;
+	constexpr int    SampleRounds = 40;
+	constexpr int    SampleGapMs  = 50;
+	constexpr size_t StackBytes   = 48 * 1024;
+	constexpr int    MaxFrames    = 32;
 
 	struct ThreadInfo {
-		DWORD                             tid    = 0;
-		HANDLE                            handle = nullptr;
-		uint64_t                          cpu0   = 0;
-		uint64_t                          cpu1   = 0;
+		DWORD                              tid    = 0;
+		HANDLE                             handle = nullptr;
+		uint64_t                           cpu0   = 0;
+		uint64_t                           cpu1   = 0;
 		std::array<uint64_t, SampleRounds> rips {};
-		int                               samples = 0;
-		std::array<uint64_t, MaxFrames>   frames {};
-		int                               frame_count = 0;
+		int                                samples = 0;
+		uint64_t                           rip     = 0;
+		uint64_t                           rsp     = 0;
+		uint64_t                           rbp     = 0;
+		std::vector<uint64_t>              stack;
+		size_t                             stack_qwords = 0;
 	};
 
+	g_sampler_phase = "enumerating modules";
 	const auto modules = HostModules();
 
+	g_sampler_phase = "enumerating threads";
 	std::vector<ThreadInfo> threads;
 	HANDLE                  snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 	if (snapshot == INVALID_HANDLE_VALUE) {
@@ -457,9 +491,9 @@ void ReportThreadSamples(std::string& out) {
 		return;
 	}
 	THREADENTRY32 entry {};
-	entry.dwSize      = sizeof(entry);
-	const auto pid    = GetCurrentProcessId();
-	const auto self   = GetCurrentThreadId();
+	entry.dwSize    = sizeof(entry);
+	const auto pid  = GetCurrentProcessId();
+	const auto self = GetCurrentThreadId();
 	for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
 		if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) {
 			continue;
@@ -473,10 +507,12 @@ void ReportThreadSamples(std::string& out) {
 		ThreadInfo info;
 		info.tid    = entry.th32ThreadID;
 		info.handle = handle;
-		threads.push_back(info);
+		info.stack.resize(StackBytes / 8);
+		threads.push_back(std::move(info));
 	}
 	CloseHandle(snapshot);
 
+	g_sampler_phase = "sampling instruction pointers";
 	for (auto& t: threads) {
 		t.cpu0 = ThreadCpu100ns(t.handle);
 	}
@@ -501,32 +537,57 @@ void ReportThreadSamples(std::string& out) {
 	}
 	const double wall_100ns = static_cast<double>(wall1 - wall0) / 100.0;
 
-	// One full stack per thread that is busy or blocked; walking happens while suspended.
+	g_sampler_phase = "copying stacks";
 	for (auto& t: threads) {
 		if (SuspendThread(t.handle) == static_cast<DWORD>(-1)) {
 			continue;
 		}
 		CONTEXT ctx {};
-		ctx.ContextFlags = CONTEXT_FULL;
+		ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
 		if (GetThreadContext(t.handle, &ctx) != 0) {
-			t.frame_count =
-			    WalkStackSafe(ctx, t.frames.data(), MaxFrames, modules.data(), modules.size());
+			t.rip = ctx.Rip;
+			t.rsp = ctx.Rsp;
+			t.rbp = ctx.Rbp;
+			// Copy as much of the stack as is readable, shrinking at the top of the stack.
+			for (size_t bytes = StackBytes; bytes >= 4096; bytes /= 2) {
+				SIZE_T read = 0;
+				if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(t.rsp),
+				                      t.stack.data(), bytes, &read) != 0) {
+					t.stack_qwords = read / 8;
+					break;
+				}
+			}
 		}
 		ResumeThread(t.handle);
 	}
 
 	// Everything below runs with all threads resumed.
+	g_sampler_phase = "loading symbols";
 	Symbolizer symbolizer;
+	g_sampler_phase = "formatting";
 	const auto guest_names = GuestThreadNames();
 	std::sort(threads.begin(), threads.end(), [](const ThreadInfo& a, const ThreadInfo& b) {
 		return (a.cpu1 - a.cpu0) > (b.cpu1 - b.cpu0);
 	});
 
+	auto is_code = [&](uint64_t v) {
+		if (v < 0x10000) {
+			return false;
+		}
+		if (FindModule(modules, v) != nullptr) {
+			return true;
+		}
+		bool  busy = false;
+		auto* rt   = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		return rt->TryFindProgramByAddr(v, &busy) != nullptr;
+	};
+
 	out += fmt::format("Threads: {} (sorted by CPU use over {:.1f} s)\n", threads.size(),
 	                   wall_100ns / 1e7);
 	for (auto& t: threads) {
-		const double cpu = wall_100ns > 0 ? 100.0 * static_cast<double>(t.cpu1 - t.cpu0) / wall_100ns
-		                                  : 0.0;
+		const double cpu = wall_100ns > 0
+		                       ? 100.0 * static_cast<double>(t.cpu1 - t.cpu0) / wall_100ns
+		                       : 0.0;
 		std::string guest_name;
 		if (auto it = guest_names.find(t.tid); it != guest_names.end()) {
 			guest_name = it->second;
@@ -543,23 +604,85 @@ void ReportThreadSamples(std::string& out) {
 			top.emplace_back(n, rip);
 		}
 		std::sort(top.rbegin(), top.rend());
-		if (cpu >= 5.0) {
-			for (size_t i = 0; i < std::min<size_t>(top.size(), 6); i++) {
+		const bool busy_thread = cpu >= 5.0;
+		if (busy_thread) {
+			for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
 				out += fmt::format("     rip {:>2}/{}  {}\n", top[i].first, t.samples,
-				                   DescribeAddress(top[i].second, modules, symbolizer));
+				                   DescribeAddress(top[i].second, modules, &symbolizer));
 			}
 		}
-		for (int i = 0; i < t.frame_count; i++) {
-			out += fmt::format("     #{:<2} {}\n", i,
-			                   DescribeAddress(t.frames[i], modules, symbolizer));
+
+		// Frame-pointer chain over the copied stack (host code is built with /Oy-).
+		const uint64_t stack_lo = t.rsp;
+		const uint64_t stack_hi = t.rsp + t.stack_qwords * 8;
+		auto read_stack = [&](uint64_t addr, uint64_t* value) {
+			if (addr < stack_lo || addr + 8 > stack_hi || (addr & 7u) != 0) {
+				return false;
+			}
+			*value = t.stack[(addr - stack_lo) / 8];
+			return true;
+		};
+		out += fmt::format("     #0  {}\n", DescribeAddress(t.rip, modules, &symbolizer));
+		uint64_t fp = t.rbp;
+		for (int i = 1; i < MaxFrames; i++) {
+			uint64_t next_fp = 0;
+			uint64_t ret     = 0;
+			if (!read_stack(fp, &next_fp) || !read_stack(fp + 8, &ret) || ret == 0) {
+				break;
+			}
+			out += fmt::format("     #{:<2} {}\n", i, DescribeAddress(ret, modules, &symbolizer));
+			if (next_fp <= fp) {
+				break;
+			}
+			fp = next_fp;
+		}
+		// For busy threads also list code addresses found anywhere on the top of the stack, in
+		// case the frame chain is broken by code built without frame pointers.
+		if (busy_thread) {
+			int listed = 0;
+			for (size_t i = 0; i < std::min<size_t>(t.stack_qwords, 2048) && listed < 24; i++) {
+				const auto value = t.stack[i];
+				if (is_code(value)) {
+					out += fmt::format("     scan +0x{:<5x} {}\n", i * 8,
+					                   DescribeAddress(value, modules, &symbolizer));
+					listed++;
+				}
+			}
 		}
 		CloseHandle(t.handle);
+	}
+	g_sampler_phase = "done";
+}
+
+// Runs the sampler on its own thread so a problem inside it cannot stop the report.
+void ReportThreadSamplesBounded(std::string& out) {
+	struct Shared {
+		std::mutex              mutex;
+		std::condition_variable cv;
+		bool                    done = false;
+		std::string             text;
+	};
+	auto shared = std::make_shared<Shared>();
+	std::thread([shared] {
+		std::string text;
+		ReportThreadSamples(text);
+		std::lock_guard lock(shared->mutex);
+		shared->text = std::move(text);
+		shared->done = true;
+		shared->cv.notify_all();
+	}).detach();
+	std::unique_lock lock(shared->mutex);
+	if (shared->cv.wait_for(lock, std::chrono::seconds(30), [&] { return shared->done; })) {
+		out += shared->text;
+	} else {
+		out += fmt::format("Thread sampler did not finish within 30 s (stuck while: {})\n",
+		                   g_sampler_phase.load());
 	}
 }
 
 #else
 
-void ReportThreadSamples(std::string& out) {
+void ReportThreadSamplesBounded(std::string& out) {
 	out += "Thread sampling is only implemented on Windows\n";
 }
 
@@ -613,6 +736,7 @@ void WatchdogThread() {
 		// Write each section as soon as it is ready, so a section that gets stuck cannot hide
 		// the ones before it.
 		ReportBlockedWaits(report, now);
+		ReportLongActivities(report, now);
 		WriteReport(report);
 		{
 			std::lock_guard lock(g_reporters_mutex);
@@ -622,8 +746,9 @@ void WatchdogThread() {
 				WriteReport(report);
 			}
 		}
+		WriteReport("--- thread samples (takes a few seconds) ---\n");
 		report.clear();
-		ReportThreadSamples(report);
+		ReportThreadSamplesBounded(report);
 		report += "=== end of hang report ===\n";
 		WriteReport(report);
 	}

@@ -320,6 +320,7 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	Kernel::HangWatchdog::Activity watch("gpu buffer flush");
 	GetScheduler().Flush();
 }
 
@@ -526,6 +527,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Kernel::HangWatchdog::SetCurrentThreadName("Kyty guest GPU");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -587,6 +589,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			Kernel::HangWatchdog::Activity watch("gpu host command");
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -598,7 +601,13 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			Kernel::HangWatchdog::Activity watch(
+			    "gpu submission", submission.queue_id,
+			    static_cast<uint64_t>(submission.type) | (submission.started ? 0x100u : 0u));
+			complete = gpu->Process(submission);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -805,6 +814,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		Kernel::HangWatchdog::Activity watch_packet("pm4 packet (arg0=opcode)", opcode,
+		                                            reinterpret_cast<uint64_t>(packet));
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;

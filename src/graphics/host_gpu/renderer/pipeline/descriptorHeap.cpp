@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "kernel/hangWatchdog.h"
 
 #include <cstdio>
 
@@ -46,6 +47,8 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
+	Kernel::HangWatchdog::Activity watch("descriptor pool refill", m_pool_scale,
+	                                     m_pending_pools.size());
 	m_pending_pools.push_back(
 	    {m_current_pool, m_master_semaphore.CurrentTick(), m_current_pool_scale});
 	if (const auto front = m_pending_pools.front(); m_master_semaphore.IsFree(front.tick)) {

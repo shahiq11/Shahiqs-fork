@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "kernel/hangWatchdog.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -246,6 +247,7 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
+			Kernel::HangWatchdog::Activity watch_res("materialize resources");
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
@@ -403,6 +405,8 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		Kernel::HangWatchdog::Activity watch_shader("shader translate", options.shader_hash,
+		                                            static_cast<uint64_t>(stage));
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
@@ -422,6 +426,7 @@ struct PipelineCache::ProgramCache {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			Kernel::HangWatchdog::Activity watch_res("materialize resources");
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
@@ -433,6 +438,8 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		Kernel::HangWatchdog::Activity watch_compile("shader compile (SPIR-V)",
+		                                             options.shader_hash);
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
