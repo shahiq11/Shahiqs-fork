@@ -1494,11 +1494,19 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (program.info.samplers[i].gather_lod) {
 			const auto control = snapshot.samplers[i].dwords[2];
 			const auto filter = (control >> 26u) & 3u;
-			// MipNone always selects the base level. Explicit point gathers currently require
-			// encoded-zero primary and secondary bias; linear primary-mip selection is unsupported.
-			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires mip filtering None or Point with zero LOD biases");
+			// MipNone always selects the base level. A gather reads a single mip level and never
+			// blends levels, so linear mip filtering selects the nearest mip like Point (the
+			// emitter rounds the clamped LOD after adding the primary LOD bias; the secondary bias
+			// is not applied).
+			if (filter > 2u) {
+				return SpecializationFail("explicit-LOD gather uses a reserved mip filter mode");
+			}
+			if (filter != 0u && (filter == 2u || (control & 0xfffffu) != 0u)) {
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					std::printf("Note: explicit-LOD gather with linear mip filtering or LOD bias uses "
+					            "the nearest biased mip level\n");
+				}
 			}
 		}
 	}

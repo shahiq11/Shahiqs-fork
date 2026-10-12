@@ -2142,8 +2142,9 @@ void TestGatherLodSamplerValidation() {
         user_data[10] = control;
         ResourceSnapshot snapshot;
         ResourceSpecialization specialization;
-        const bool supported = !explicit_lod || (control >> 26u) == 0 ||
-                               control == (1u << 26u);
+        // Gathers read one mip level: linear mip filtering acts as nearest-mip and LOD biases are
+        // approximated; only the reserved filter mode is rejected.
+        const bool supported = !explicit_lod || (control >> 26u) != 3u;
         Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                    specialization) == supported,
               "explicit gather accepted an unsupported sampler or rejected a valid one");

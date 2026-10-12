@@ -397,6 +397,7 @@ public:
 	}
 
 	std::string Name(uint64_t addr) {
+		std::lock_guard lock(m_mutex);
 		if (!m_ok) {
 			return {};
 		}
@@ -428,7 +429,14 @@ private:
 	decltype(&SymFromAddr)          m_from_addr = nullptr;
 	decltype(&SymGetLineFromAddr64) m_line      = nullptr;
 	bool                            m_ok        = false;
+	std::mutex                      m_mutex;
 };
+
+// DbgHelp must be initialized once per process and is not thread-safe.
+Symbolizer& SharedSymbolizer() {
+	static Symbolizer symbolizer;
+	return symbolizer;
+}
 
 std::string DescribeAddress(uint64_t addr, const std::vector<ModuleRange>& modules,
                             Symbolizer* symbolizer) {
@@ -579,7 +587,7 @@ void ReportThreadSamples(std::string& out) {
 
 	// Everything below runs with all threads resumed.
 	g_sampler_phase = "loading symbols";
-	Symbolizer symbolizer;
+	Symbolizer& symbolizer = SharedSymbolizer();
 	g_sampler_phase = "formatting";
 	const auto guest_names = GuestThreadNames();
 	std::sort(threads.begin(), threads.end(), [](const ThreadInfo& a, const ThreadInfo& b) {
@@ -765,7 +773,7 @@ void ProfileBusyThreads(std::string& out, int duration_ms) {
 		t->cpu1 = ThreadCpu100ns(t->handle);
 	}
 
-	Symbolizer symbolizer;
+	Symbolizer& symbolizer = SharedSymbolizer();
 	const auto guest_names = GuestThreadNames();
 	std::unordered_map<uint64_t, std::string> names;
 	auto function_of = [&](uint64_t addr) -> const std::string& {
