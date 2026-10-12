@@ -249,7 +249,12 @@ void CanonicalizeBoundedImageTable(const ImageResource& base, ResourceSnapshot& 
 	std::vector<uint32_t> new_ordinal(children_end - children_begin + 1u, 0u);
 	for (const auto& [key, members]: groups) {
 		(void)key;
-		const size_t capacity = std::max(MinGroupCapacity, std::bit_ceil(members.size()));
+		// Dynamic-mip candidates (mip count in the low key bits > 1) each own a run of
+		// per-mip descriptors, so padding them would only add work.
+		const bool   single_mip = (key & 0xffffffffull) <= 1u;
+		const size_t capacity   = single_mip
+		                              ? std::max(MinGroupCapacity, std::bit_ceil(members.size()))
+		                              : members.size();
 		for (const auto old_index: members) {
 			new_ordinal[old_index - children_begin + 1u] =
 			    static_cast<uint32_t>(new_descriptors.size() + 1u);
@@ -842,7 +847,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				const auto source_class = specialization.images[last_typed];
 				image.numeric_class     = source_class.numeric_class;
 				image.dimension         = source_class.dimension;
-				image.mip_count         = source_class.mip_count;
+				// A null binding is a single-level view; it never takes a per-mip descriptor run.
+				image.mip_count         = 1u;
 				image.conversion_format = source_class.conversion_format;
 				image.shader_swizzle    = source_class.shader_swizzle;
 				image.cube              = source_class.cube;
@@ -857,8 +863,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			} else if (!same_coordinates &&
 			           !(is_2d(image.dimension) && is_2d(image_class.dimension))) {
 				mismatch = "dimension/cube";
-			} else if (image.mip_count != image_class.mip_count) {
-				mismatch = "mip count";
 			} else if (image.conversion_format != image_class.conversion_format) {
 				mismatch = "conversion format";
 			} else if (image.shader_swizzle != image_class.shader_swizzle) {

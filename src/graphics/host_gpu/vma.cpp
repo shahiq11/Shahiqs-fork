@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -69,11 +70,18 @@ void GraphicContext::LogMemoryBudget() const {
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
-		LOGF("VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
-		     ", blocks=%" PRIu64 "\n",
-		     i, static_cast<uint64_t>(budgets[i].usage), static_cast<uint64_t>(budgets[i].budget),
-		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
-		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
+		// Printed to the console as well: this only runs when an allocation failed.
+		std::printf("VMA heap %u (%s): usage=%" PRIu64 " MiB, budget=%" PRIu64
+		            " MiB, allocations=%" PRIu64 " MiB in %u, blocks=%" PRIu64 " MiB\n",
+		            i,
+		            (properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+		                ? "device-local"
+		                : "host",
+		            static_cast<uint64_t>(budgets[i].usage) >> 20u,
+		            static_cast<uint64_t>(budgets[i].budget) >> 20u,
+		            static_cast<uint64_t>(budgets[i].statistics.allocationBytes) >> 20u,
+		            budgets[i].statistics.allocationCount,
+		            static_cast<uint64_t>(budgets[i].statistics.blockBytes) >> 20u);
 	}
 }
 
@@ -141,7 +149,16 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
+		std::printf("vmaCreateImage failed: %s (%d), %ux%ux%u format=%d levels=%u layers=%u "
+		            "usage=0x%x flags=0x%x\n",
+		            vk::to_string(result).c_str(), static_cast<int>(result),
+		            image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+		            static_cast<int>(image_info.format), image_info.mipLevels,
+		            image_info.arrayLayers,
+		            static_cast<vk::ImageUsageFlags::MaskType>(image_info.usage),
+		            static_cast<vk::ImageCreateFlags::MaskType>(image_info.flags));
 		LogMemoryBudget();
+		std::fflush(stdout);
 		return false;
 	}
 
