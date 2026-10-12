@@ -30,14 +30,23 @@ private:
 		uint32_t                                          allocation = DescriptorSetBatch;
 	};
 
+	struct PendingPool {
+		vk::DescriptorPool pool  = nullptr;
+		uint64_t           tick  = 0;
+		uint32_t           scale = 1;
+	};
+
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
 	void               CreateDescriptorPool();
 
-	GraphicContext&                                     m_graphics;
-	MasterSemaphore&                                    m_master_semaphore;
-	vk::DescriptorPool                                  m_current_pool = nullptr;
-	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
-	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
+	GraphicContext&                                    m_graphics;
+	MasterSemaphore&                                   m_master_semaphore;
+	vk::DescriptorPool                                 m_current_pool       = nullptr;
+	uint32_t                                           m_current_pool_scale = 1;
+	// Pool sizes are multiplied by this; it grows when one set does not fit an empty pool.
+	uint32_t                                           m_pool_scale = 1;
+	std::deque<PendingPool>                            m_pending_pools;
+	std::unordered_map<vk::DescriptorSetLayout, Batch> m_sets;
 };
 
 } // namespace Libs::Graphics
