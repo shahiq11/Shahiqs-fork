@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 
@@ -144,9 +145,27 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto              result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result == vk::Result::eErrorOutOfDeviceMemory) {
+		// VRAM is full (games can stream more textures than the card holds while loading).
+		// Fall back to any memory type the device can use, typically system memory over PCIe:
+		// slower to sample, but the game keeps running and the texture cache frees VRAM later.
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			std::printf("Warning: video memory is full; placing new textures in system memory\n");
+			LogMemoryBudget();
+			std::fflush(stdout);
+		}
+		alloc_info.requiredFlags  = 0;
+		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		native_image              = VK_NULL_HANDLE;
+		image.allocation          = nullptr;
+		result                    = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+            &native_image, &image.allocation, nullptr));
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		std::printf("vmaCreateImage failed: %s (%d), %ux%ux%u format=%d levels=%u layers=%u "

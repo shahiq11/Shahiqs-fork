@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -79,11 +81,31 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
+	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
+	if (result == vk::Result::eErrorOutOfDeviceMemory) {
+		// Over the heap budget: let VMA exceed it or fall back to another memory type the device
+		// can use (typically system memory) instead of aborting.
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			std::printf("Warning: buffer memory over budget; allowing fallback memory\n");
+			graphics.LogMemoryBudget();
+			std::fflush(stdout);
+		}
+		allocation_info.flags &= ~static_cast<VmaAllocationCreateFlags>(
+		    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		native_buffer = VK_NULL_HANDLE;
+		m_allocation  = nullptr;
+		result        = static_cast<vk::Result>(vmaCreateBuffer(
+            graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+            &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
+		std::printf("vmaCreateBuffer failed: %s, size=%llu\n", vk::to_string(result).c_str(),
+		            static_cast<unsigned long long>(size));
 		graphics.LogMemoryBudget();
+		std::fflush(stdout);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 

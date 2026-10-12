@@ -1951,8 +1951,11 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// Near the VRAM budget, loading screens create thousands of images within a few frames;
+		// waiting for long-unused images frees nothing, so evict anything not used for a few
+		// frames, in larger batches (destruction is deferred until the GPU is done with it).
+		const uint64_t age       = std::min<uint64_t>(aggressive ? 4 : pressured ? 30 : 16, tick);
+		size_t         deletions = aggressive ? 512 : pressured ? 64 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
