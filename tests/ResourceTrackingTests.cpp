@@ -278,6 +278,11 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   return fixture;
 }
 
+// Broad-heap image tables pad each binding-type group of candidates to a power-of-two capacity
+// (minimum 16) and round their mapping length up to a power of two (minimum 1024 words, capped at
+// the table size), so the specialization is stable while a streamed table grows.
+constexpr size_t BroadHeapGroupCapacity = 16u;
+
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, true);
   fixture->PlanAndTrack();
@@ -311,12 +316,12 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
+            snapshot.images.size() == 1u + BroadHeapGroupCapacity && memory.watched_reads == 1u &&
             memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
   const auto mapping = root.indirect_mapping_offset;
-  Check(root.indirect_search_iterations == 0u && snapshot.flattened_srt[mapping] == 17u &&
+  Check(root.indirect_search_iterations == 0u && snapshot.flattened_srt[mapping] == 36u &&
             snapshot.flattened_srt[mapping + 1u] == 0u &&
             snapshot.flattened_srt[mapping + 5u] == 1u &&
             snapshot.flattened_srt[mapping + 17u] == 2u &&
@@ -327,7 +332,7 @@ void TestInvariantIndirectImageMaterialization() {
   put(112u, 1u);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             specialization == original_specialization && memory.watched_reads == 2u &&
-            snapshot.flattened_srt[mapping] == 29u,
+            snapshot.flattened_srt[mapping] == 36u,
         "moving a table entry changed shader specialization or reused stale mapping bytes");
   put(112u, 7u);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -340,7 +345,7 @@ void TestInvariantIndirectImageMaterialization() {
   put(0u, 0u);
   memory.fail_address = 0x2010u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.watched_dwords == 4u && snapshot.images.size() == 2u &&
+            memory.watched_dwords == 4u && snapshot.images.size() == 1u + BroadHeapGroupCapacity &&
             snapshot.images[1].dwords == descriptor,
         "partial descriptor prefix did not zero its out-of-bounds DWORDs");
   memory.fail_address = 0x2008u;
@@ -408,10 +413,10 @@ void TestBoundedImageViewEligibility() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4u && memory.reads == 1u,
+            snapshot.images.size() == 1u + BroadHeapGroupCapacity && memory.reads == 1u,
         "unrelated cube/3D heap entries prevented a typed 2D table view");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
-  Check(snapshot.flattened_srt[mapping] == 53u &&
+  Check(snapshot.flattened_srt[mapping] == 60u &&
             snapshot.flattened_srt[mapping + 5u] == 1u &&
             snapshot.flattened_srt[mapping + 17u] == 0u &&
             snapshot.flattened_srt[mapping + 29u] == 0u &&
@@ -527,7 +532,7 @@ void TestWaterfallImageTable() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 1u &&
-            snapshot.images.size() == 2u,
+            snapshot.images.size() == 1u + BroadHeapGroupCapacity,
         "shared scalar/waterfall table repeated its coherent bulk read");
   const auto handle = std::ranges::find_if(*fixture->program.blocks[1], [](const Inst &inst) {
     return inst.GetOpcode() == ValueOpcode::GetImageResource;

@@ -55,6 +55,8 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+// Guest addresses below this are never mapped; reads through them yield zero (null descriptors).
+constexpr uint64_t NullPageSize = 0x10000ull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -442,6 +444,22 @@ void CompileSrtWalker(ResourcePlan& program) {
 	code.mov(code.r9, AddressMask & ~uint64_t {3});
 	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
 	// descend through its child pointers. Seed the descriptor evaluator's memo.
+	using Entry = ResourcePlan::EvaluationContext::Entry;
+	// A table pointer in the null page reads as zeros (null descriptors), like an unused SRT
+	// slot the shader never dereferences on its active path; the whole subtree is zeroed.
+	const auto zero = [&](auto&& self, const Reads& reads) -> void {
+		for (const auto& [offset, read]: reads) {
+			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+			const auto slot = code.rdx + index * sizeof(Entry);
+			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], 0);
+			code.mov(code.qword[slot + offsetof(Entry, value)], 0);
+			code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto child = pointer_uses.find(read->value.ResolveInstruction());
+			if (child != pointer_uses.end()) self(self, child->second);
+		}
+	};
 	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
 		code.push(code.rdi);
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
@@ -458,9 +476,14 @@ void CompileSrtWalker(ResourcePlan& program) {
 			code.cmp(code.rdi, code.r10);
 			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
 		}
+		Xbyak::Label valid, done;
+		code.cmp(code.rdi, NullPageSize);
+		code.jae(valid, Xbyak::CodeGenerator::T_NEAR);
+		zero(zero, reads);
+		code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
+		code.L(valid);
 		for (const auto& [offset, read]: reads) {
 			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
-			using Entry = ResourcePlan::EvaluationContext::Entry;
 			const auto slot = code.rdx + index * sizeof(Entry);
 			code.mov(code.r10d, code.dword[code.rdi + offset]);
 			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
@@ -472,6 +495,7 @@ void CompileSrtWalker(ResourcePlan& program) {
 			if (child == pointer_uses.end()) continue;
 			self(self, offset, child->second);
 		}
+		code.L(done);
 		code.pop(code.rdi);
 	};
 	for (const auto& [reg, reads]: roots) {
@@ -691,6 +715,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
+		if (address < NullPageSize) {
+			result = 0u;
+			return true;
+		}
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
