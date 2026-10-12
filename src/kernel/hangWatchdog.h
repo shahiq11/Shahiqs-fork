@@ -51,6 +51,10 @@ void SetCurrentThreadName(const char* name) noexcept;
 // thread on first use.
 void NotifyProgress() noexcept;
 
+// Named counters printed in every kyty_perf_log.txt line (for example texture memory).
+enum class Gauge : uint32_t { TextureCount, TextureMiB, DeviceMiB, Count };
+void SetGauge(Gauge gauge, uint64_t value) noexcept;
+
 // Called for every completed video-out flip; feeds the FPS log (kyty_perf_log.txt).
 void NotifyFlip() noexcept;
 

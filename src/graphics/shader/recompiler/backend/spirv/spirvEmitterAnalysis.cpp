@@ -209,15 +209,16 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 }
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
-                           uint32_t texel) {
+                           uint32_t texel, uint32_t array_index) {
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage);
 	if (!image.atomic) {
 		state.builder.RequireCapability(spv::CapabilityStorageImageWriteWithoutFormat);
 	}
 	const auto EmitWrite = [&](uint32_t mip) {
-		state.builder.AddFunction(spv::OpImageWrite, LoadImageDescriptor(state, resource, mip),
-		                          coord, texel);
+		state.builder.AddFunction(spv::OpImageWrite,
+		                          LoadImageDescriptor(state, resource, mip, array_index), coord,
+		                          texel);
 	};
 	if (image.mip_mode != IR::ImageMipMode::Dynamic) {
 		EmitWrite(0);

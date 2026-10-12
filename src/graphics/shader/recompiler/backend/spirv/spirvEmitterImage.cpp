@@ -296,10 +296,10 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 }
 
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                         const IR::Inst& address) {
-	const auto  dimension = ctx.state.program.info.images.at(mem.resource).dimension;
+                         const IR::Inst& address, uint32_t resource, uint32_t array_index) {
+	const auto  dimension = ctx.state.program.info.images.at(resource).dimension;
 	const auto& info      = ImageDimensionInfoFor(dimension);
-	const auto  image     = LoadImageDescriptor(ctx.state, mem.resource);
+	const auto  image     = LoadImageDescriptor(ctx.state, resource, 0u, array_index);
 	const auto  size      = ctx.state.builder.AllocateId();
 	if (info.multisampled != 0u) {
 		ctx.state.builder.AddFunction(spv::OpImageQuerySize,
@@ -619,9 +619,11 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return PackImageTexel(ctx, mem, texel);
 }
 
+// Emits an image operation for a direct image, or for every typed run of an indirect image
+// table selected at runtime. `emit(resource, array_index)` may return a value or void.
 template <typename Emit>
-uint32_t EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                         const Emit& emit) {
+auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
+                     const Emit& emit) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
@@ -716,19 +718,27 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
-		ctx.Define(inst, QueryDimensions(ctx, mem, *address));
+		ctx.Define(inst, EmitImageAccess(ctx, inst, TypeU32Vector(state, 4),
+		                                 [&](uint32_t resource, uint32_t array_index) {
+			                                 return QueryDimensions(ctx, mem, *address, resource,
+			                                                        array_index);
+		                                 }));
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		const auto dimension = image.dimension;
-		const auto sampled = MakeSampledImage(state, mem.resource,
-		                                     LoadSamplerDescriptor(state, mem.sampler));
-		const auto lod       = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
-		    CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components,
-		             image.cube));
+		const auto lod       = EmitImageAccess(
+            ctx, inst, TypeF32Vector(state, 2), [&](uint32_t resource, uint32_t array_index) {
+                const auto sampled = MakeSampledImage(
+                    state, resource, LoadSamplerDescriptor(state, mem.sampler), 0u, array_index);
+                const auto query = state.builder.AllocateId();
+                state.builder.AddFunction(
+                    spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled,
+                    CoordF32(ctx, mem, *address, 0,
+                             ImageDimensionInfoFor(dimension).spatial_components, image.cube));
+                return query;
+            });
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
 		                      ConstantU32(state, 0)};
 		for (uint32_t index = 0; index < 2u; index++) {
@@ -788,7 +798,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			        : 0u;
 			const auto coord = CoordU32(ctx, mem, *address, dimension);
 			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
+			EmitImageAccess(ctx, inst, 0u, [&](uint32_t resource, uint32_t array_index) {
+				EmitStorageImageWrite(state, resource, mip_lod, coord, texel, array_index);
+			});
 		});
 		return;
 	}

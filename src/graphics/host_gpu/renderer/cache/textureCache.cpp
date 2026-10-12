@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "kernel/hangWatchdog.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -219,6 +220,10 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_registered_images++;
+	m_registered_bytes += image.AccountedSize();
+	Kernel::HangWatchdog::SetGauge(Kernel::HangWatchdog::Gauge::TextureCount, m_registered_images);
+	Kernel::HangWatchdog::SetGauge(Kernel::HangWatchdog::Gauge::TextureMiB, m_registered_bytes >> 20u);
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -243,6 +248,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	m_registered_images--;
+	m_registered_bytes -= std::min(m_registered_bytes, accounted);
+	Kernel::HangWatchdog::SetGauge(Kernel::HangWatchdog::Gauge::TextureCount, m_registered_images);
+	Kernel::HangWatchdog::SetGauge(Kernel::HangWatchdog::Gauge::TextureMiB, m_registered_bytes >> 20u);
 	image.registered = false;
 }
 
@@ -1944,6 +1953,8 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		Kernel::HangWatchdog::SetGauge(Kernel::HangWatchdog::Gauge::DeviceMiB,
+		                               m_total_used_memory >> 20u);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
