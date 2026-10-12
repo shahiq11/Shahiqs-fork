@@ -1617,7 +1617,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
-	Kernel::HangWatchdog::NotifyProgress();
+	Kernel::HangWatchdog::NotifyFlip();
 }
 
 void VideoOutDriver::WaitForSubmitSlot(int handle) {

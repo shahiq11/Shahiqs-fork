@@ -67,6 +67,7 @@ struct Slot {
 std::array<Slot, MaxSlots> g_slots;
 std::atomic_uint32_t       g_slot_count {0};
 std::atomic_uint64_t       g_progress {0};
+std::atomic_uint64_t       g_flips {0};
 std::once_flag             g_start_once;
 
 std::mutex                                                     g_reporters_mutex;
@@ -182,6 +183,11 @@ void SetCurrentThreadName(const char* name) noexcept {
 void NotifyProgress() noexcept {
 	g_progress.fetch_add(1, std::memory_order_relaxed);
 	std::call_once(g_start_once, [] { std::thread(WatchdogThread).detach(); });
+}
+
+void NotifyFlip() noexcept {
+	g_flips.fetch_add(1, std::memory_order_relaxed);
+	NotifyProgress();
 }
 
 void AppendDiagnostic(const char* file_name, const std::string& text) {
@@ -713,10 +719,28 @@ void WatchdogThread() {
 	int64_t  last_report_ns   = 0;
 	uint32_t reports_in_stall = 0;
 	uint32_t total_reports    = 0;
+	const int64_t start_ns    = NowNs();
+	int64_t  perf_ns          = start_ns;
+	uint64_t perf_flips       = g_flips.load(std::memory_order_relaxed);
+	uint64_t perf_progress    = last_progress;
 
 	for (;;) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 		const auto now      = NowNs();
+		if (now - perf_ns >= 5'000'000'000) {
+			const auto flips    = g_flips.load(std::memory_order_relaxed);
+			const auto progress = g_progress.load(std::memory_order_relaxed);
+			const auto seconds  = static_cast<double>(now - perf_ns) / 1e9;
+			AppendDiagnostic("kyty_perf_log.txt",
+			                 fmt::format("t={:7.1f}s flips/s={:6.1f} progress/s={:6.1f} total_flips={}\n",
+			                             static_cast<double>(now - start_ns) / 1e9,
+			                             static_cast<double>(flips - perf_flips) / seconds,
+			                             static_cast<double>(progress - perf_progress) / seconds,
+			                             flips));
+			perf_ns       = now;
+			perf_flips    = flips;
+			perf_progress = progress;
+		}
 		const auto progress = g_progress.load(std::memory_order_relaxed);
 		if (progress != last_progress) {
 			if (reports_in_stall != 0) {

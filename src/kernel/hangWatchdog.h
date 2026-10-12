@@ -51,6 +51,9 @@ void SetCurrentThreadName(const char* name) noexcept;
 // thread on first use.
 void NotifyProgress() noexcept;
 
+// Called for every completed video-out flip; feeds the FPS log (kyty_perf_log.txt).
+void NotifyFlip() noexcept;
+
 // Adds a callback that appends subsystem state to a hang report. Called from the watchdog thread
 // while no thread is suspended; it must not block indefinitely.
 void AddReporter(const char* name, std::function<void(std::string&)> reporter);
