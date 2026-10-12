@@ -669,6 +669,26 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	if (Persist()) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
+}
+
+void PipelineCache::NotePipelineCompile(double milliseconds) {
+	m_persist_pending |= milliseconds >= 250.0;
+	const auto now = std::chrono::steady_clock::now();
+	if (m_persist_pending && now - m_last_persist >= std::chrono::seconds(10)) {
+		m_last_persist    = now;
+		m_persist_pending = false;
+		(void)Persist();
+	}
+}
+
+bool PipelineCache::Persist() {
+	if (m_driver_cache == nullptr) {
+		return false;
+	}
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -690,7 +710,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -698,7 +718,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -715,12 +735,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1025,8 +1044,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto create_start = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
+	NotePipelineCompile(std::chrono::duration<double, std::milli>(
+	                        std::chrono::steady_clock::now() - create_start)
+	                        .count());
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1057,12 +1080,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto       cached       = std::make_unique<Pipeline>();
 	const auto create_start = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	const double create_ms = std::chrono::duration<double, std::milli>(
+	                             std::chrono::steady_clock::now() - create_start)
+	                             .count();
 	Kernel::HangWatchdog::AppendDiagnostic(
 	    "kyty_shader_log.txt",
-	    fmt::format("  cs pipeline id={} driver compile {:.0f} ms\n", compute_program.id,
-	                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-	                                                          create_start)
-	                    .count()));
+	    fmt::format("  cs pipeline id={} driver compile {:.0f} ms\n", compute_program.id, create_ms));
+	NotePipelineCompile(create_ms);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
