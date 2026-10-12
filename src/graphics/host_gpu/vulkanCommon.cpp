@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -118,6 +119,9 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 }
 
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
+	if (result == vk::Result::eErrorDeviceLost) {
+		GpuBreadcrumbs::ReportDeviceLost();
+	}
 	if (result != vk::Result::eSuccess) {
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));

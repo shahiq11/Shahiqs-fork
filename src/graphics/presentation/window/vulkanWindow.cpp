@@ -1,4 +1,5 @@
 #include <SDL3/SDL.h>
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include <SDL3/SDL_vulkan.h>
 
 #include "common/assert.h"
@@ -1036,6 +1037,9 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		if (HasExtension(available_extensions, GpuBreadcrumbs::ExtensionName())) {
+			device_extensions.push_back(GpuBreadcrumbs::ExtensionName());
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1054,6 +1058,8 @@ void WindowContext::CreateVulkan() {
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
+	GpuBreadcrumbs::Init(graphic_ctx,
+	                     HasExtension(device_extensions, GpuBreadcrumbs::ExtensionName()));
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
