@@ -202,6 +202,9 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	EXIT_IF(!kind.has_value());
 	if (array_index == 0u) {
 		array_index = ConstantU32(state, image.descriptor_index + mip);
+	} else if (mip != 0u) {
+		// A runtime slot addresses mip 0 of the selected image; its other mips follow it.
+		array_index = Binary(state, spv::OpIAdd, TypeU32(state), array_index, ConstantU32(state, mip));
 	}
 	const auto& definition = state.images[IR::ImageBindingIndex(*kind)];
 	return DescriptorElementPointer(state, definition.pointer_type, definition.variable,

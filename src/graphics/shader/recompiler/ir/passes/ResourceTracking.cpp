@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
 #include <map>
 #include <optional>
@@ -929,6 +930,14 @@ private:
 					current.indirect_descriptor->table_record_bytes = std::max(
 					    current.indirect_descriptor->table_record_bytes,
 					    descriptor.indirect_descriptor->table_record_bytes);
+					// Shared tables keep only the alignment that every access satisfies.
+					auto& current_indirect = *current.indirect_descriptor;
+					const auto& other      = *descriptor.indirect_descriptor;
+					const auto  merged =
+					    MeetCongruence({current_indirect.table_align_bits, current_indirect.table_align_residue},
+					                   {other.table_align_bits, other.table_align_residue});
+					current_indirect.table_align_bits    = merged.bits;
+					current_indirect.table_align_residue = merged.residue;
 				}
 				return candidate;
 			}
@@ -1062,6 +1071,108 @@ private:
 		    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
 		    !ImmediateU32(builtin->Arg(1), axis) || axis >= 3u) return UINT32_MAX;
 		return axis;
+	}
+
+	// value == residue (mod 2^bits); bits == 0 means nothing is known.
+	struct Congruence {
+		uint32_t bits    = 0;
+		uint32_t residue = 0;
+	};
+
+	static Congruence MakeCongruence(uint32_t bits, uint32_t residue) {
+		bits = std::min(bits, 32u);
+		return {bits, bits >= 32u ? residue : residue & ((1u << bits) - 1u)};
+	}
+
+	static Congruence MeetCongruence(Congruence a, Congruence b) {
+		const auto differ = a.residue ^ b.residue;
+		const auto agree  = differ == 0u ? 32u : static_cast<uint32_t>(std::countr_zero(differ));
+		return MakeCongruence(std::min({a.bits, b.bits, agree}), a.residue);
+	}
+
+	// Low-bit knowledge of a U32 shader value (for example a descriptor byte offset computed as
+	// index * 32 + 8). Loops are not followed: a Phi reached again while it is evaluated is unknown.
+	Congruence ValueCongruence(Value value, std::map<const Inst*, Congruence>& phis,
+	                           uint32_t depth = 0) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			return value.GetType() == Type::U32 ? MakeCongruence(32u, value.U32()) : Congruence {};
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 32u) return {};
+		const auto arg = [&](size_t index) {
+			return index < inst->NumArgs() ? ValueCongruence(inst->Arg(index), phis, depth + 1u)
+			                               : Congruence {};
+		};
+		const auto immediate = [&](size_t index, uint32_t& result) {
+			return index < inst->NumArgs() && ImmediateU32(inst->Arg(index), result);
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::Phi: {
+				if (const auto found = phis.find(inst); found != phis.end()) return found->second;
+				phis.emplace(inst, Congruence {});
+				std::optional<Congruence> result;
+				for (size_t index = 0; index < inst->NumArgs(); ++index) {
+					const auto arm = arg(index);
+					result = result ? MeetCongruence(*result, arm) : arm;
+					if (result->bits == 0u) break;
+				}
+				phis[inst] = result.value_or(Congruence {});
+				return phis[inst];
+			}
+			case ValueOpcode::SelectU32: return MeetCongruence(arg(1), arg(2));
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane: return arg(0);
+			case ValueOpcode::IAdd32: {
+				const auto a = arg(0), b = arg(1);
+				return MakeCongruence(std::min(a.bits, b.bits), a.residue + b.residue);
+			}
+			case ValueOpcode::ISub32: {
+				const auto a = arg(0), b = arg(1);
+				return MakeCongruence(std::min(a.bits, b.bits), a.residue - b.residue);
+			}
+			case ValueOpcode::CompositeExtractU32x2: {
+				// s_add_u32 produces {sum, carry}; only the sum is followed.
+				uint32_t component = 1u;
+				const auto* add = inst->Arg(0).Resolve().TryInstruction();
+				if (!immediate(1, component) || component != 0u || add == nullptr ||
+				    add->GetOpcode() != ValueOpcode::IAddCarry32 || add->NumArgs() != 2u) return {};
+				const auto a = ValueCongruence(add->Arg(0), phis, depth + 1u);
+				const auto b = ValueCongruence(add->Arg(1), phis, depth + 1u);
+				return MakeCongruence(std::min(a.bits, b.bits), a.residue + b.residue);
+			}
+			case ValueOpcode::IMul32: {
+				const auto a = arg(0), b = arg(1);
+				// (ra + 2^ta * x) * (rb + 2^tb * y) == ra * rb (mod 2^min(ta + tz(rb), tb + tz(ra))).
+				const auto tz = [](const Congruence& c) {
+					return c.residue == 0u ? c.bits : std::min<uint32_t>(c.bits, std::countr_zero(c.residue));
+				};
+				return MakeCongruence(std::min(a.bits + tz(b), b.bits + tz(a)), a.residue * b.residue);
+			}
+			case ValueOpcode::ShiftLeftLogical32: {
+				uint32_t shift = 0;
+				if (!immediate(1, shift) || shift >= 32u) return {};
+				const auto a = arg(0);
+				return MakeCongruence(a.bits + shift, a.residue << shift);
+			}
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32: {
+				uint32_t mask = 0;
+				size_t   other = 0;
+				if (immediate(1, mask)) other = 0;
+				else if (immediate(0, mask)) other = 1;
+				else return {};
+				const auto a     = arg(other);
+				const auto low   = a.bits >= 32u ? UINT32_MAX : (1u << a.bits) - 1u;
+				const bool is_and = inst->GetOpcode() == ValueOpcode::BitwiseAnd32;
+				// AND clears and OR sets bits, which are then known regardless of the input.
+				const auto known = low | (is_and ? ~mask : mask);
+				const auto bits  = known == UINT32_MAX ? 32u
+				                                       : static_cast<uint32_t>(std::countr_one(known));
+				return MakeCongruence(bits, is_and ? a.residue & mask : a.residue | mask);
+			}
+			default: return {};
+		}
 	}
 
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
@@ -1799,8 +1910,22 @@ private:
 			indirect.table_immediate = 0u;
 			indirect.workgroup_axis = UINT32_MAX;
 			plan.table_read = plan.reads[0];
-			if (plan.table_indexed) indirect.table_record_bytes = table_immediate + 32u;
-			else indirect.table_scalar = true;
+			if (plan.table_indexed) {
+				indirect.table_record_bytes = table_immediate + 32u;
+				// offset = index * V#.stride + immediate; the host adds the stride's alignment.
+				indirect.table_align_bits    = 32u;
+				indirect.table_align_residue = table_immediate;
+			} else {
+				indirect.table_scalar = true;
+				// offset = (dynamic & ~3) + (immediate & ~3), see the key projection above.
+				std::map<const Inst*, Congruence> phis;
+				const auto dynamic = ValueCongruence(plan.reads[0]->Arg(1), phis);
+				if (dynamic.bits > 2u) {
+					indirect.table_align_bits    = dynamic.bits;
+					indirect.table_align_residue = MakeCongruence(
+					    dynamic.bits, (dynamic.residue & ~3u) + (table_immediate & ~3u)).residue;
+				}
+			}
 			plan.retain_reads = true;
 		}
 

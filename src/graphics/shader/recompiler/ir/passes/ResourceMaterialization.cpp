@@ -521,7 +521,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				std::ranges::copy(cached.mapping, snapshot.flattened_srt.begin() +
 				                                      static_cast<std::ptrdiff_t>(mapping_offset + 1u));
 			} else {
+				// The shader can only address T#s at offsets congruent to its known alignment
+				// (for example every 32 bytes). Probing the other DWORDs only finds stray bit
+				// patterns that decode as textures and cost a host image each.
+				uint32_t align_bits = indirect.table_align_bits;
+				if (indirect.table_record_bytes != 0u) {
+					align_bits = indirect.table_scalar
+					                 ? 0u
+					                 : std::min<uint32_t>(align_bits, std::countr_zero(table.Stride()));
+				}
+				const uint32_t word_bits    = align_bits > 2u ? std::min(align_bits - 2u, 16u) : 0u;
+				const uint32_t word_mask    = (1u << word_bits) - 1u;
+				const uint32_t word_residue = (indirect.table_align_residue >> 2u) & word_mask;
 				for (uint32_t word = 0; word < keys.size(); ++word) {
+					if ((word & word_mask) != word_residue) continue;
 					DescriptorValue candidate {.dword_count = dword_count};
 					std::copy_n(keys.begin() + word,
 					            std::min<size_t>(dword_count, keys.size() - word),
@@ -532,6 +545,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					if (ordinal == 0u) continue;
 					snapshot.flattened_srt.resize(mapping_offset + 2u + word, 0u);
 					snapshot.flattened_srt[mapping_offset + 1u + word] = ordinal;
+				}
+				static thread_local std::unordered_set<const void*> reported;
+				if (reported.size() < 4096 && reported.insert(&program).second) {
+					std::printf("Broad image heap: %zu dwords, probing every %u dword(s) at +%u, "
+					            "%zu distinct texture(s)\n",
+					            keys.size(), word_mask + 1u, word_residue,
+					            descriptors.size() - children_begin);
 				}
 				cached.valid        = true;
 				cached.content_hash = content_hash;

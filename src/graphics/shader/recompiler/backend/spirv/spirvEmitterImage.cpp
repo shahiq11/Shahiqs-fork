@@ -643,10 +643,15 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto selected = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	// A run is a range of ordinals whose descriptors are evenly spaced in one binding array:
+	// ordinal k uses slots [slot_bias + k * stride, + stride), one slot per mip for dynamic-mip
+	// images. Broad-heap tables sort candidates by binding type and mip count (see
+	// CanonicalizeBoundedImageTable), so thousands of textures collapse into a few runs.
 	struct ImageRun {
 		uint32_t first;
 		uint32_t count;
 		uint32_t resource;
+		uint32_t stride;
 		uint32_t slot_bias;
 	};
 	std::vector<ImageRun> runs;
@@ -654,28 +659,35 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		const auto resource = image.indirect_resources[ordinal];
 		const auto& candidate = state.program.info.images[resource];
 		const auto kind = *IR::DescriptorBindingForImage(candidate);
+		const auto stride = std::max(candidate.mip_count, 1u);
 		if (!runs.empty()) {
 			auto& run = runs.back();
 			const auto& first = state.program.info.images[run.resource];
-			const auto next_slot = run.slot_bias + ordinal;
 			if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
-			    IR::DescriptorBindingForImage(first) == kind &&
-			    candidate.mip_count == 1u && first.mip_count == 1u &&
-			    (ordinal == 1u || candidate.descriptor_index == next_slot)) {
+			    IR::DescriptorBindingForImage(first) == kind && stride == run.stride &&
+			    candidate.mip_mode == first.mip_mode) {
 				// Native roots precede appended children; only the root may have a slot gap.
-				if (ordinal == 1u)
-					run.slot_bias = candidate.descriptor_index - ordinal;
-				++run.count;
-				continue;
+				if (ordinal == 1u && run.first == 0u && run.count == 1u) {
+					run.slot_bias = candidate.descriptor_index - ordinal * stride;
+					++run.count;
+					continue;
+				}
+				if (candidate.descriptor_index == run.slot_bias + ordinal * stride) {
+					++run.count;
+					continue;
+				}
 			}
 		}
-		runs.push_back({ordinal, 1u, resource,
-		                candidate.descriptor_index - ordinal});
+		runs.push_back({ordinal, 1u, resource, stride, candidate.descriptor_index - ordinal * stride});
 	}
 	const auto EmitRun = [&](uint32_t index) {
 		const auto& run = runs[index];
 		if (run.count == 1u) return emit(run.resource, 0u);
-		auto slot = Binary(state, spv::OpIAdd, TypeU32(state), selected,
+		const auto scaled = run.stride == 1u
+		                        ? selected
+		                        : Binary(state, spv::OpIMul, TypeU32(state), selected,
+		                                 ConstantU32(state, run.stride));
+		auto slot = Binary(state, spv::OpIAdd, TypeU32(state), scaled,
 		                   ConstantU32(state, run.slot_bias));
 		if (run.first == 0u) {
 			const auto root_slot = image.descriptor_index;
@@ -877,11 +889,23 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
 					return sample;
 				};
-				return candidate.mip_mode == IR::ImageMipMode::Dynamic && candidate.mip_count > 1u
-				           ? EmitIndexSwitch(
-				                 state, GatherMip(ctx, inst, mem, *address, layout, candidate.mip_count),
-				                 candidate.mip_count, result_type, EmitMip)
-				           : EmitMip(0u);
+				if (candidate.mip_mode != IR::ImageMipMode::Dynamic || candidate.mip_count <= 1u) {
+					return EmitMip(0u);
+				}
+				// Per-mip views occupy consecutive slots, so the mip indexes the binding array
+				// directly instead of branching over one gather per mip.
+				const auto mip  = GatherMip(ctx, inst, mem, *address, layout, candidate.mip_count);
+				const auto base = array_index != 0u ? array_index
+				                                    : ConstantU32(state, candidate.descriptor_index);
+				const auto slot = Binary(state, spv::OpIAdd, TypeU32(state), base, mip);
+				const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, slot);
+				const auto sample = state.builder.AllocateId();
+				const std::array operands {operand_mask, offset};
+				state.builder.AddFunction(
+				    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
+				    sample, sampled, coord, component_or_dref,
+				    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
+				return sample;
 			};
 			const auto sample = EmitImageAccess(ctx, inst, result_type, EmitGather);
 			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
