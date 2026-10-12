@@ -132,6 +132,58 @@ uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descri
 	return base <= last ? last - base + 1u : 0u;
 }
 
+// A broad heap also holds descriptors for other typed operations. Sampled candidates of one
+// indirect table must share a numeric class, so keep the dominant class (ties go to the first
+// candidate) and treat the others as unrelated null entries, as is done for mismatched dimensions.
+template <typename Specialization>
+void NullMinorityNumericClasses(std::vector<DescriptorValue>&        descriptors,
+                                const std::vector<Specialization>& specializations,
+                                uint32_t                            root) {
+	constexpr size_t ClassCount = 4;
+	std::array<uint32_t, ClassCount> votes {};
+	std::array<size_t, ClassCount>   first {};
+	first.fill(SIZE_MAX);
+	const auto class_of = [](const DescriptorValue& descriptor) {
+		const auto format =
+		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		return static_cast<size_t>(Prospero::SampledTextureNumericClass(format));
+	};
+	const auto count = std::min(descriptors.size(), specializations.size());
+	for (size_t index = 0; index < count; ++index) {
+		if (index == root || specializations[index].indirect_root != root ||
+		    NullImageDescriptor(descriptors[index])) {
+			continue;
+		}
+		const auto numeric_class = class_of(descriptors[index]);
+		if (numeric_class >= ClassCount ||
+		    numeric_class == static_cast<size_t>(Prospero::TextureNumericClass::Unsupported)) {
+			continue;
+		}
+		++votes[numeric_class];
+		first[numeric_class] = std::min(first[numeric_class], index);
+	}
+	size_t dominant = ClassCount;
+	for (size_t numeric_class = 0; numeric_class < ClassCount; ++numeric_class) {
+		if (votes[numeric_class] == 0u) continue;
+		if (dominant == ClassCount || votes[numeric_class] > votes[dominant] ||
+		    (votes[numeric_class] == votes[dominant] && first[numeric_class] < first[dominant])) {
+			dominant = numeric_class;
+		}
+	}
+	if (dominant == ClassCount) return;
+	for (size_t index = 0; index < count; ++index) {
+		if (index == root || specializations[index].indirect_root != root ||
+		    NullImageDescriptor(descriptors[index])) {
+			continue;
+		}
+		const auto numeric_class = class_of(descriptors[index]);
+		if (numeric_class != dominant && numeric_class < ClassCount &&
+		    numeric_class != static_cast<size_t>(Prospero::TextureNumericClass::Unsupported)) {
+			descriptors[index].dwords.fill(0u);
+		}
+	}
+}
+
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
 	if (descriptor.dword_count != std::size(result.fields)) {
 		return false;
@@ -1218,6 +1270,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				        return true;
 			        })) {
 				return false;
+			}
+			if (bounded_table && image.resource_class == ImageResourceClass::Sampled &&
+			    !image.atomic) {
+				NullMinorityNumericClasses(snapshot.images, specialization.images, i);
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
