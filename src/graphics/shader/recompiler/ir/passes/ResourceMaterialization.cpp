@@ -609,14 +609,33 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
-			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+			const char* mismatch = nullptr;
+			if (image.numeric_class != image_class.numeric_class) {
+				mismatch = "numeric class";
+			} else if (!same_coordinates &&
+			           !(is_2d(image.dimension) && is_2d(image_class.dimension))) {
+				mismatch = "dimension/cube";
+			} else if (image.mip_count != image_class.mip_count) {
+				mismatch = "mip count";
+			} else if (image.conversion_format != image_class.conversion_format) {
+				mismatch = "conversion format";
+			} else if (image.shader_swizzle != image_class.shader_swizzle) {
+				mismatch = "shader swizzle";
+			}
+			if (mismatch != nullptr) {
+				return SpecializationFail(fmt::format(
+				    "indirect image table at pc 0x{:08x} has incompatible candidates: {} differs "
+				    "(candidate {} vs exemplar {}: numeric {}/{}, dim {}/{}, cube {}/{}, "
+				    "mips {}/{}, conv {}/{}, swizzle {:03x}/{:03x})",
+				    program.info.images[root_index].first_use_pc, mismatch, candidate, exemplar,
+				    static_cast<uint32_t>(image.numeric_class),
+				    static_cast<uint32_t>(image_class.numeric_class),
+				    static_cast<uint32_t>(image.dimension),
+				    static_cast<uint32_t>(image_class.dimension), image.cube, image_class.cube,
+				    image.mip_count, image_class.mip_count,
+				    static_cast<uint32_t>(image.conversion_format),
+				    static_cast<uint32_t>(image_class.conversion_format), image.shader_swizzle,
+				    image_class.shader_swizzle));
 			}
 		}
 	}
