@@ -34,6 +34,9 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <utility>
+#include <filesystem>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 
@@ -128,6 +131,27 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+// Diagnostics: keep a copy of unusually large shaders (guest binary and generated SPIR-V) in
+// _BigShaders so their size can be investigated offline. Once per shader hash and kind.
+constexpr size_t BigShaderWords = 400000;
+
+void DumpBigShader(const char* kind, const char* stage_name, uint64_t shader_hash,
+                   std::span<const uint32_t> words) {
+	static std::mutex                              mutex;
+	static std::unordered_set<std::string>         written;
+	const auto name = fmt::format("{}_{:016x}.{}", stage_name, shader_hash, kind);
+	{
+		std::lock_guard lock(mutex);
+		if (!written.insert(name).second) return;
+	}
+	const auto path = std::filesystem::path("_BigShaders") / name;
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (!file.IsInvalid()) {
+		file.Write(words.data(), static_cast<uint32_t>(words.size_bytes()));
+	}
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
@@ -355,6 +379,9 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (result.spirv.size() >= BigShaderWords) {
+			DumpBigShader("spv", stage_name, options.shader_hash, result.spirv);
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
@@ -508,6 +535,9 @@ struct PipelineCache::ProgramCache {
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
+		if (permutation.spirv_words >= BigShaderWords) {
+			DumpBigShader("bin", stage_name, options.shader_hash, params.code);
+		}
 		Kernel::HangWatchdog::AppendDiagnostic(
 		    "kyty_shader_log.txt",
 		    fmt::format("{} {:016x} v{} id={} SPIR-V {} words, {} images, {} buffers, "
