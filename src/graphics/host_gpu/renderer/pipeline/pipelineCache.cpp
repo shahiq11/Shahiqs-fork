@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -222,7 +223,57 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		size_t                                       spirv_words = 0;
 	};
+
+	// Diagnostics: says which part of the resource specialization forced a new permutation.
+	static std::string DescribeSpecializationChange(
+	    const ShaderRecompiler::IR::ResourceSpecialization& before,
+	    const ShaderRecompiler::IR::ResourceSpecialization& after) {
+		std::string text = fmt::format("images {}->{}, buffers {}->{}", before.images.size(),
+		                               after.images.size(), before.buffers.size(),
+		                               after.buffers.size());
+		uint32_t changed_images = 0;
+		std::string first_image;
+		for (size_t i = 0; i < std::min(before.images.size(), after.images.size()); i++) {
+			const auto& a = before.images[i];
+			const auto& b = after.images[i];
+			if (a == b) continue;
+			changed_images++;
+			if (!first_image.empty()) continue;
+			first_image = fmt::format(" first changed image #{}:", i);
+			if (a.numeric_class != b.numeric_class) first_image += fmt::format(" class {}->{}", static_cast<int>(a.numeric_class), static_cast<int>(b.numeric_class));
+			if (a.dimension != b.dimension) first_image += fmt::format(" dim {}->{}", static_cast<int>(a.dimension), static_cast<int>(b.dimension));
+			if (a.mip_count != b.mip_count) first_image += fmt::format(" mips {}->{}", a.mip_count, b.mip_count);
+			if (a.conversion_format != b.conversion_format) first_image += fmt::format(" conv_fmt {}->{}", static_cast<int>(a.conversion_format), static_cast<int>(b.conversion_format));
+			if (a.shader_swizzle != b.shader_swizzle) first_image += fmt::format(" swizzle {:x}->{:x}", a.shader_swizzle, b.shader_swizzle);
+			if (a.indirect_root != b.indirect_root) first_image += fmt::format(" ind_root {}->{}", a.indirect_root, b.indirect_root);
+			if (a.indirect_mapping_offset != b.indirect_mapping_offset) first_image += fmt::format(" ind_map_off {}->{}", a.indirect_mapping_offset, b.indirect_mapping_offset);
+			if (a.indirect_search_iterations != b.indirect_search_iterations) first_image += fmt::format(" ind_iters {}->{}", a.indirect_search_iterations, b.indirect_search_iterations);
+			if (a.cube != b.cube) first_image += " cube";
+			if (a.fmask != b.fmask) first_image += " fmask";
+		}
+		uint32_t changed_buffers = 0;
+		std::string first_buffer;
+		for (size_t i = 0; i < std::min(before.buffers.size(), after.buffers.size()); i++) {
+			const auto& a = before.buffers[i];
+			const auto& b = after.buffers[i];
+			if (a == b) continue;
+			changed_buffers++;
+			if (!first_buffer.empty()) continue;
+			first_buffer = fmt::format(" first changed buffer #{}:", i);
+			if (a.packed_stride != b.packed_stride) first_buffer += fmt::format(" stride {}->{}", a.packed_stride, b.packed_stride);
+			if (a.descriptor_format != b.descriptor_format) first_buffer += fmt::format(" fmt {}->{}", static_cast<int>(a.descriptor_format), static_cast<int>(b.descriptor_format));
+			if (a.descriptor_swizzle != b.descriptor_swizzle) first_buffer += " swizzle";
+			if (a.zero_stride_oob != b.zero_stride_oob) first_buffer += " zero_stride_oob";
+			if (a.indirect_root != b.indirect_root) first_buffer += fmt::format(" ind_root {}->{}", a.indirect_root, b.indirect_root);
+			if (a.indirect_mapping_offset != b.indirect_mapping_offset) first_buffer += fmt::format(" ind_map_off {}->{}", a.indirect_mapping_offset, b.indirect_mapping_offset);
+			if (a.indirect_search_iterations != b.indirect_search_iterations) first_buffer += fmt::format(" ind_iters {}->{}", a.indirect_search_iterations, b.indirect_search_iterations);
+		}
+		text += fmt::format("; {} image(s) and {} buffer(s) changed;{}{}", changed_images,
+		                    changed_buffers, first_image, first_buffer);
+		return text;
+	}
 
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
@@ -307,6 +358,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		const auto spirv_words = result.spirv.size();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -316,6 +368,7 @@ struct PipelineCache::ProgramCache {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .spirv_words    = spirv_words,
 		};
 	}
 
@@ -440,10 +493,32 @@ struct PipelineCache::ProgramCache {
 		}
 		Kernel::HangWatchdog::Activity watch_compile("shader compile (SPIR-V)",
 		                                             options.shader_hash);
+		const auto previous_count = entry->second.permutations.size();
+		std::string why = previous_count == 0
+		                      ? std::string("first version")
+		                      : DescribeSpecializationChange(
+		                            entry->second.permutations.back().specialization,
+		                            entry->second.specialization);
+		if (previous_count != 0 &&
+		    entry->second.permutations.back().specialization == entry->second.specialization) {
+			why = "same specialization, different push-data start or function code";
+		}
+		const auto compile_start = std::chrono::steady_clock::now();
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
+		Kernel::HangWatchdog::AppendDiagnostic(
+		    "kyty_shader_log.txt",
+		    fmt::format("{} {:016x} v{} id={} SPIR-V {} words, {} images, {} buffers, "
+		                "recompile {:.0f} ms: {}\n",
+		                stage_name, options.shader_hash, previous_count + 1, permutation.handle.id,
+		                permutation.spirv_words, entry->second.specialization.images.size(),
+		                entry->second.specialization.buffers.size(),
+		                std::chrono::duration<double, std::milli>(
+		                    std::chrono::steady_clock::now() - compile_start)
+		                    .count(),
+		                why));
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -979,8 +1054,15 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<Pipeline>();
+	auto       cached       = std::make_unique<Pipeline>();
+	const auto create_start = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	Kernel::HangWatchdog::AppendDiagnostic(
+	    "kyty_shader_log.txt",
+	    fmt::format("  cs pipeline id={} driver compile {:.0f} ms\n", compute_program.id,
+	                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                                          create_start)
+	                    .count()));
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

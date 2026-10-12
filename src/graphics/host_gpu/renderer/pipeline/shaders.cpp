@@ -599,6 +599,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
+	{
+		uint64_t descriptors = 0;
+		for (const auto& binding: descriptor_bindings) {
+			descriptors += binding.descriptorCount;
+		}
+		Kernel::HangWatchdog::AppendDiagnostic(
+		    "kyty_shader_log.txt",
+		    fmt::format("  cs layout: {} bindings, {} descriptors, wave {}\n",
+		                descriptor_bindings.size(), descriptors, wave_size));
+	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};

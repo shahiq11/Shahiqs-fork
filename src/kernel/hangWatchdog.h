@@ -41,6 +41,9 @@ private:
 	bool m_pushed = false;
 };
 
+// Appends a line to a diagnostics file in the working directory (thread safe).
+void AppendDiagnostic(const char* file_name, const std::string& text);
+
 // Records the current thread's guest name so reports can show it.
 void SetCurrentThreadName(const char* name) noexcept;
 

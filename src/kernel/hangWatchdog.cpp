@@ -184,6 +184,15 @@ void NotifyProgress() noexcept {
 	std::call_once(g_start_once, [] { std::thread(WatchdogThread).detach(); });
 }
 
+void AppendDiagnostic(const char* file_name, const std::string& text) {
+	static std::mutex mutex;
+	std::lock_guard   lock(mutex);
+	if (auto* file = std::fopen(file_name, "ab"); file != nullptr) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
+
 void AddReporter(const char* name, std::function<void(std::string&)> reporter) {
 	std::lock_guard lock(g_reporters_mutex);
 	g_reporters.emplace_back(name, std::move(reporter));
