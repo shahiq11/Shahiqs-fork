@@ -10,6 +10,7 @@
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/hangWatchdog.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
@@ -2102,12 +2103,18 @@ static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* f
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
                                           const uint32_t* timeout_micros) {
+	Kernel::HangWatchdog::WaitScope watch("wait_on_addr", nullptr,
+	                                      reinterpret_cast<uint64_t>(address), expected,
+	                                      __builtin_return_address(0));
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
                                             const uint32_t* timeout_micros) {
+	Kernel::HangWatchdog::WaitScope watch("wait_on_addr", nullptr,
+	                                      reinterpret_cast<uint64_t>(address), expected,
+	                                      __builtin_return_address(0));
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
@@ -2116,6 +2123,9 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected,
                                             const uint32_t* timeout_micros) {
+	Kernel::HangWatchdog::WaitScope watch("wait_on_addr", nullptr,
+	                                      reinterpret_cast<uint64_t>(address), expected,
+	                                      __builtin_return_address(0));
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
 	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,

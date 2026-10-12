@@ -147,6 +147,19 @@ public:
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
+	// Why the queue last paused (hang watchdog diagnostics; written only by the GPU thread).
+	struct SuspendInfo {
+		const char* reason = nullptr;
+		uint64_t    addr   = 0;
+		uint64_t    ref    = 0;
+		uint64_t    mask   = 0;
+		uint32_t    func   = 0;
+		uint32_t    size   = 0;
+		uint64_t    count  = 0;
+	};
+	[[nodiscard]] SuspendInfo GetLastSuspend() const { return m_last_suspend; }
+	[[nodiscard]] int         GetQueueEventId() const { return m_interrupt_event_id; }
+
 private:
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
@@ -155,6 +168,10 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void NoteSuspend(const char* reason, uint64_t addr = 0, uint64_t ref = 0, uint64_t mask = 0,
+	                 uint32_t func = 0, uint32_t size = 0) {
+		m_last_suspend = {reason, addr, ref, mask, func, size, m_last_suspend.count + 1};
+	}
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -184,6 +201,7 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	SuspendInfo m_last_suspend;
 };
 
 } // namespace Libs::Graphics

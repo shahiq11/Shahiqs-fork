@@ -16,12 +16,14 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "kernel/hangWatchdog.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdio>
 #include <deque>
@@ -30,6 +32,7 @@
 #include <semaphore>
 #include <thread>
 #include <vector>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -37,6 +40,7 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+static std::atomic<GuestGpu*>         g_report_gpu {nullptr};
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -64,6 +68,15 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
+	g_report_gpu.store(this, std::memory_order_release);
+	static std::once_flag reporter_once;
+	std::call_once(reporter_once, [] {
+		Kernel::HangWatchdog::AddReporter("guest GPU", [](std::string& out) {
+			if (auto* gpu = g_report_gpu.load(std::memory_order_acquire); gpu != nullptr) {
+				gpu->DebugReport(out);
+			}
+		});
+	});
 }
 
 GuestGpu::~GuestGpu() {
@@ -71,6 +84,8 @@ GuestGpu::~GuestGpu() {
 }
 
 void GuestGpu::Shutdown() {
+	GuestGpu* expected = this;
+	g_report_gpu.compare_exchange_strong(expected, nullptr);
 	std::lock_guard shutdown_lock(m_shutdown_mutex);
 	if (m_shutdown_complete) {
 		return;
@@ -172,11 +187,74 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	{
+		Kernel::HangWatchdog::WaitScope watch("gpu_suspend_point", "previous frame not finished",
+		                                      static_cast<uint64_t>(m_done_num.load()), 0,
+		                                      __builtin_return_address(0));
+		m_suspend_point_ready->acquire();
+	}
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
 	m_done_num++;
+	Kernel::HangWatchdog::NotifyProgress();
+}
+
+void GuestGpu::DebugReport(std::string& out) {
+	static constexpr const char* type_names[] = {"Graphics", "Compute", "FlipPreparation",
+	                                             "SuspendPoint"};
+	out += fmt::format("frame(suspend points)={} submit_id={}\n", m_done_num.load(), m_submit_id);
+	out += m_renderer.GetCommandScheduler().DebugState() + "\n";
+
+	bool locked = false;
+	for (int i = 0; i < 100 && !locked; i++) {
+		locked = m_queue_mutex.TryLock();
+		if (!locked) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+	}
+	if (!locked) {
+		out += "GPU queue mutex is held by another thread for > 1 s (GPU thread stuck inside a "
+		       "command?)\n";
+		return;
+	}
+	out += fmt::format("queued submissions={} pending host commands={} processing={} "
+	                   "accepting={} stopping={}\n",
+	                   m_submission_count, m_commands.size(), m_processing, m_accepting,
+	                   m_stopping);
+	for (uint32_t id = 0; id < QueueCount; id++) {
+		const auto& queue = m_queues[id];
+		if (queue.empty()) {
+			continue;
+		}
+		const auto& front = queue.front();
+		out += fmt::format("  queue {:2} ({}): {} submission(s); front: type={} started={} "
+		                   "blocked={} cmd_done={} const_done={} cmd_dw={}\n",
+		                   id, (id == 0 ? "gfx" : "compute"), queue.size(),
+		                   type_names[static_cast<int>(front.type)], front.started, front.blocked,
+		                   front.command_complete, front.constant_complete,
+		                   front.commands.size());
+		const CommandProcessor* cp =
+		    (id == 0 ? m_gfx_cp.get() : m_compute_cp[id - 1].get());
+		if (cp != nullptr) {
+			const auto info = cp->GetLastSuspend();
+			if (info.reason != nullptr) {
+				std::string current = "?";
+				if (info.size == 4 && info.addr != 0) {
+					current = fmt::format(
+					    "0x{:x}", *reinterpret_cast<const volatile uint32_t*>(info.addr));
+				} else if (info.size == 8 && info.addr != 0) {
+					current = fmt::format(
+					    "0x{:x}", *reinterpret_cast<const volatile uint64_t*>(info.addr));
+				}
+				out += fmt::format("      last pause #{}: {} addr=0x{:x} ref=0x{:x} mask=0x{:x} "
+				                   "func={} size={} current_value={}\n",
+				                   info.count, info.reason, info.addr, info.ref, info.mask,
+				                   info.func, info.size, current);
+			}
+		}
+	}
+	m_queue_mutex.Unlock();
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -258,6 +336,7 @@ void CommandProcessor::ResetDeCe() {
 
 void CommandProcessor::WaitCe() {
 	if (m_ce_count <= m_de_count && !m_ce_complete) {
+		NoteSuspend("wait_ce", m_ce_count, m_de_count);
 		SuspendPm4();
 	}
 }
@@ -265,12 +344,14 @@ void CommandProcessor::WaitCe() {
 void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	EXIT_IF(m_de_count > m_ce_count);
 	if (m_ce_count - m_de_count >= diff) {
+		NoteSuspend("wait_de_diff", m_ce_count, m_de_count, diff);
 		SuspendPm4();
 	}
 }
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
+		NoteSuspend("wait_rewind");
 		SuspendPm4();
 	}
 }
@@ -316,6 +397,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		NoteSuspend("wait_reg_mem", reinterpret_cast<uint64_t>(addr), ref, mask, func,
+		            static_cast<uint32_t>(sizeof(T)));
 		SuspendPm4();
 	}
 }
@@ -807,6 +890,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
+						NoteSuspend("predication_wait", reinterpret_cast<uint64_t>(address));
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;

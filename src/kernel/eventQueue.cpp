@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "kernel/hangWatchdog.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -50,7 +51,8 @@ public:
 	int TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data);
 	int DeleteEvent(uintptr_t ident, int16_t filter);
 
-	int  GetTriggeredEvents(KernelEvent* ev, int num);
+	int         GetTriggeredEvents(KernelEvent* ev, int num);
+	std::string DescribeEvents();
 	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
 	void Close();
 
@@ -85,6 +87,21 @@ void KernelEqueuePrivate::Close() {
 	}
 	m_events.clear();
 	m_cond_var.SignalAll();
+}
+
+std::string KernelEqueuePrivate::DescribeEvents() {
+	Common::LockGuard lock(m_mutex);
+	std::string       text = m_name + " [";
+	for (const auto& event: m_events) {
+		if (text.size() > 40) {
+			text += "...";
+			break;
+		}
+		text += fmt::format("{}:{:x}{} ", event.event.filter, event.event.ident,
+		                    event.triggered ? "*" : "");
+	}
+	text += "]";
+	return text;
 }
 
 int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
@@ -420,6 +437,12 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	const bool  blocking   = (timo == nullptr || *timo != 0);
+	const auto  watch_name = (blocking ? owner->DescribeEvents() : std::string {});
+	Kernel::HangWatchdog::WaitScope watch(blocking ? "equeue" : "equeue_poll", watch_name.c_str(),
+	                                      static_cast<uint64_t>(eq),
+	                                      (timo == nullptr ? UINT64_MAX : *timo),
+	                                      __builtin_return_address(0));
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}

@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "kernel/hangWatchdog.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -16,6 +17,7 @@
 #include "loader/runtimeLinker.h"
 #include "loader/timer.h"
 
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1242,6 +1244,9 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+// Guest call site of the current blocking pthread call, for the hang watchdog.
+static thread_local const void* g_watch_caller = nullptr;
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1265,6 +1270,12 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			return ETIMEDOUT;
 		}
 		return EDEADLK;
+	}
+
+	std::optional<Kernel::HangWatchdog::WaitScope> watch;
+	if (mutex->owner != nullptr && (timeout_us == nullptr || *timeout_us != 0)) {
+		watch.emplace("mutex", mutex->name.c_str(), mutex->owner->host_thread_id, 0,
+		              g_watch_caller);
 	}
 
 	if (timeout_us == nullptr) {
@@ -1745,7 +1756,8 @@ int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 
 	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
 
-	int result = NativeMutexLock(*mutex, nullptr);
+	g_watch_caller = __builtin_return_address(0);
+	int result     = NativeMutexLock(*mutex, nullptr);
 
 	// LOGF("\tmutex lock: %s, %d\n", (*mutex)->name.c_str(), result);
 
@@ -1799,7 +1811,8 @@ int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec
 
 	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
 
-	int result = NativeMutexLock(*mutex, &usec);
+	g_watch_caller = __builtin_return_address(0);
+	int result     = NativeMutexLock(*mutex, &usec);
 
 	switch (result) {
 		case 0: return OK;
@@ -2861,6 +2874,10 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
+	g_watch_caller = __builtin_return_address(0);
+	Kernel::HangWatchdog::WaitScope watch("cond", cond_value->name.c_str(),
+	                                      reinterpret_cast<uint64_t>(cond_value), 0,
+	                                      g_watch_caller);
 
 	uint32_t recurse = 0;
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
@@ -2950,6 +2967,10 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
+	g_watch_caller = __builtin_return_address(0);
+	Kernel::HangWatchdog::WaitScope watch("cond", cond_value->name.c_str(),
+	                                      reinterpret_cast<uint64_t>(cond_value), 0,
+	                                      g_watch_caller);
 
 	uint32_t recurse = 0;
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
@@ -3026,6 +3047,10 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
+	g_watch_caller = __builtin_return_address(0);
+	Kernel::HangWatchdog::WaitScope watch("cond", cond_value->name.c_str(),
+	                                      reinterpret_cast<uint64_t>(cond_value), 0,
+	                                      g_watch_caller);
 
 	uint32_t recurse = 0;
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
@@ -3200,6 +3225,7 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	Kernel::HangWatchdog::SetCurrentThreadName(thread->name.c_str());
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/hangWatchdog.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1615,11 +1616,14 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
+	Kernel::HangWatchdog::NotifyProgress();
 }
 
 void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	auto* cfg = m_impl->Get(handle);
 	EXIT_IF(cfg == nullptr);
+	Kernel::HangWatchdog::WaitScope watch("flip_submit_slot", nullptr,
+	                                      static_cast<uint64_t>(handle));
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
@@ -1628,6 +1632,8 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
+	Kernel::HangWatchdog::WaitScope watch("flip_done", nullptr, static_cast<uint64_t>(handle),
+	                                      static_cast<uint64_t>(index));
 	m_impl->GetFlipQueue().Wait(*ctx, index);
 }
 

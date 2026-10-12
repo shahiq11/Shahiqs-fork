@@ -259,6 +259,30 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 	return !m_priority_operations.empty() || m_priority_active;
 }
 
+std::string CommandScheduler::DebugState() {
+	const auto known_before = m_master.KnownGpuTick();
+	m_master.Refresh();
+	std::string text = "host GPU: current_tick=" + std::to_string(m_master.CurrentTick()) +
+	                   " completed_tick=" + std::to_string(m_master.KnownGpuTick()) +
+	                   " (known before refresh " + std::to_string(known_before) + ")";
+	std::unique_lock lock(m_operation_mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return text + ", operation queues: mutex busy";
+	}
+	text += ", pending_ops=" + std::to_string(m_pending_operations.size());
+	if (!m_pending_operations.empty()) {
+		text += " (front tick " + std::to_string(m_pending_operations.front().tick) + ")";
+	}
+	text += ", priority_ops=" + std::to_string(m_priority_operations.size());
+	if (!m_priority_operations.empty()) {
+		text += " (front tick " + std::to_string(m_priority_operations.front().tick) + ")";
+	}
+	text += m_priority_active ? (", priority op RUNNING for tick " +
+	                             std::to_string(m_priority_active_tick))
+	                          : ", no priority op running";
+	return text;
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;

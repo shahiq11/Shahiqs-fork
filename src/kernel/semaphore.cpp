@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "kernel/hangWatchdog.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -291,6 +292,9 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	Kernel::HangWatchdog::WaitScope watch("sema", sem->GetName().c_str(),
+	                                      static_cast<uint64_t>(need), 0,
+	                                      __builtin_return_address(0));
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;
@@ -624,6 +628,8 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	Kernel::HangWatchdog::WaitScope watch("posix_sem", nullptr, reinterpret_cast<uint64_t>(sem), 0,
+	                                      __builtin_return_address(0));
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -639,11 +645,15 @@ int KYTY_SYSV_ABI sem_trywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
+	Kernel::HangWatchdog::WaitScope watch("posix_sem", nullptr, reinterpret_cast<uint64_t>(sem), 0,
+	                                      __builtin_return_address(0));
 	const int result = SemTimedwaitImpl(sem, &usec);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
 int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abstime) {
+	Kernel::HangWatchdog::WaitScope watch("posix_sem", nullptr, reinterpret_cast<uint64_t>(sem), 0,
+	                                      __builtin_return_address(0));
 	uint32_t micros = 0;
 	if (!AbsTimespecToMicros(abstime, &micros)) {
 		return SetErrnoReturn(POSIX_EINVAL);
@@ -697,6 +707,8 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	Kernel::HangWatchdog::WaitScope watch("posix_sem", nullptr, reinterpret_cast<uint64_t>(sem), 0,
+	                                      __builtin_return_address(0));
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
@@ -712,6 +724,8 @@ int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
+	Kernel::HangWatchdog::WaitScope watch("posix_sem", nullptr, reinterpret_cast<uint64_t>(sem), 0,
+	                                      __builtin_return_address(0));
 	uint32_t  micros = usec;
 	const int result = Posix::SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? OK : Posix::PosixToKernel(result));

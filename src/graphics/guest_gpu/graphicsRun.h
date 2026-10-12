@@ -15,6 +15,7 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -44,6 +45,9 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+
+	// Appends queue state to a hang watchdog report; never blocks for long.
+	void DebugReport(std::string& out);
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

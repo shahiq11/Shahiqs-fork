@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/hangWatchdog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -26,6 +27,8 @@ public:
 	virtual ~KernelEventFlagPrivate();
 
 	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
+
+	[[nodiscard]] const std::string& GetName() const { return m_name; }
 
 	void   Set(uint64_t bits);
 	void   Clear(uint64_t bits);
@@ -296,8 +299,10 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	const auto mode = DecodeEventFlagWaitMode(wait_mode);
+	Kernel::HangWatchdog::WaitScope watch("event_flag", ef->GetName().c_str(), bit_pattern,
+	                                      wait_mode, __builtin_return_address(0));
+	auto result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;
 
