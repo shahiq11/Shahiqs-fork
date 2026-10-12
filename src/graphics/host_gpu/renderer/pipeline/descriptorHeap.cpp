@@ -13,11 +13,13 @@ namespace {
 
 constexpr uint32_t   DescriptorHeapCount = 1024;
 constexpr uint32_t   MaxPoolScale        = 64;
+// Broad-heap texture tables bind up to a few thousand sampled images per set, so size pools
+// for many such sets instead of growing and churning pools every few dispatches.
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 16384},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 4096},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 4096},
 };
 
 } // namespace

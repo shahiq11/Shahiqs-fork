@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <fmt/format.h>
@@ -669,6 +670,183 @@ void ReportThreadSamples(std::string& out) {
 	g_sampler_phase = "done";
 }
 
+
+// Periodic sampling profile of busy threads, written to kyty_profile.txt. Shows where frame time
+// goes when the game is running (not stalled): self time per function and the hottest stacks.
+void ProfileBusyThreads(std::string& out, int duration_ms) {
+	constexpr int GapMs     = 2;
+	constexpr int MaxFrames = 16;
+
+	struct Sample {
+		std::array<uint64_t, MaxFrames> frames {};
+		int                             count = 0;
+	};
+	struct ThreadInfo {
+		DWORD               tid    = 0;
+		HANDLE              handle = nullptr;
+		uint64_t            cpu0   = 0;
+		uint64_t            cpu1   = 0;
+		std::vector<Sample> samples;
+	};
+
+	const auto modules = HostModules();
+	std::vector<ThreadInfo> threads;
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	THREADENTRY32 entry {};
+	entry.dwSize    = sizeof(entry);
+	const auto pid  = GetCurrentProcessId();
+	const auto self = GetCurrentThreadId();
+	for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) {
+			continue;
+		}
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+		                               THREAD_QUERY_LIMITED_INFORMATION | THREAD_QUERY_INFORMATION,
+		                           FALSE, entry.th32ThreadID);
+		if (handle == nullptr) {
+			continue;
+		}
+		ThreadInfo info;
+		info.tid    = entry.th32ThreadID;
+		info.handle = handle;
+		info.samples.reserve(static_cast<size_t>(duration_ms / GapMs) + 16);
+		threads.push_back(std::move(info));
+	}
+	CloseHandle(snapshot);
+
+	// Pre-pass: only sample threads that actually use CPU (keeps the overhead low).
+	for (auto& t: threads) {
+		t.cpu0 = ThreadCpu100ns(t.handle);
+	}
+	Sleep(200);
+	std::vector<ThreadInfo*> busy;
+	for (auto& t: threads) {
+		if (ThreadCpu100ns(t.handle) - t.cpu0 >= 100000) { // >= 10 ms of CPU in 200 ms
+			busy.push_back(&t);
+		}
+	}
+	for (auto* t: busy) {
+		t->cpu0 = ThreadCpu100ns(t->handle);
+	}
+	const auto wall0 = NowNs();
+	while ((NowNs() - wall0) / 1000000 < duration_ms) {
+		for (auto* t: busy) {
+			if (SuspendThread(t->handle) == static_cast<DWORD>(-1)) {
+				continue;
+			}
+			CONTEXT ctx {};
+			ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+			if (GetThreadContext(t->handle, &ctx) != 0) {
+				Sample sample;
+				sample.frames[sample.count++] = ctx.Rip;
+				uint64_t fp = ctx.Rbp;
+				while (sample.count < MaxFrames && fp >= ctx.Rsp && fp - ctx.Rsp < (8ull << 20u)) {
+					uint64_t pair[2] {};
+					SIZE_T   read = 0;
+					if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(fp),
+					                      pair, sizeof(pair), &read) == 0 ||
+					    read != sizeof(pair) || pair[1] == 0 || pair[0] <= fp) {
+						break;
+					}
+					sample.frames[sample.count++] = pair[1];
+					fp                            = pair[0];
+				}
+				t->samples.push_back(sample);
+			}
+			ResumeThread(t->handle);
+		}
+		Sleep(GapMs);
+	}
+	const double wall_100ns = static_cast<double>(NowNs() - wall0) / 100.0;
+	for (auto* t: busy) {
+		t->cpu1 = ThreadCpu100ns(t->handle);
+	}
+
+	Symbolizer symbolizer;
+	const auto guest_names = GuestThreadNames();
+	std::unordered_map<uint64_t, std::string> names;
+	auto function_of = [&](uint64_t addr) -> const std::string& {
+		auto it = names.find(addr);
+		if (it != names.end()) {
+			return it->second;
+		}
+		std::string name;
+		if (const auto* m = FindModule(modules, addr); m != nullptr) {
+			name = symbolizer.Name(addr);
+			if (auto plus = name.rfind("+0x"); plus != std::string::npos) {
+				name.resize(plus);
+			}
+			if (auto bracket = name.find(" ["); bracket != std::string::npos) {
+				name.resize(bracket);
+			}
+			name = name.empty() ? fmt::format("{}+0x{:x}", m->name, (addr - m->begin) & ~0xffull)
+			                    : m->name.substr(0, m->name.find('.')) + "!" + name;
+		} else {
+			// Guest code: bucket by 256 bytes.
+			name = DescribeGuestAddress(addr & ~0xffull);
+		}
+		return names.emplace(addr, std::move(name)).first->second;
+	};
+
+	std::sort(busy.begin(), busy.end(), [](const ThreadInfo* a, const ThreadInfo* b) {
+		return (a->cpu1 - a->cpu0) > (b->cpu1 - b->cpu0);
+	});
+	for (auto* t: busy) {
+		const double cpu = 100.0 * static_cast<double>(t->cpu1 - t->cpu0) / wall_100ns;
+		std::string guest_name;
+		if (auto it = guest_names.find(t->tid); it != guest_names.end()) {
+			guest_name = it->second;
+		}
+		out += fmt::format("== tid={} cpu={:.0f}% thread=\"{}\" samples={}\n", t->tid, cpu,
+		                   guest_name, t->samples.size());
+		if (t->samples.empty()) {
+			continue;
+		}
+		std::unordered_map<std::string, int> self_counts;
+		std::unordered_map<std::string, int> total_counts;
+		std::unordered_map<std::string, int> stack_counts;
+		for (const auto& sample: t->samples) {
+			self_counts[function_of(sample.frames[0])]++;
+			std::vector<const std::string*> seen;
+			std::string                     stack;
+			for (int i = 0; i < sample.count; i++) {
+				const auto& name = function_of(sample.frames[i]);
+				if (std::find(seen.begin(), seen.end(), &name) == seen.end()) {
+					seen.push_back(&name);
+					total_counts[name]++;
+				}
+				if (i < 6) {
+					stack += (i == 0 ? "" : " <- ") + name;
+				}
+			}
+			stack_counts[stack]++;
+		}
+		auto print_top = [&](const char* title, std::unordered_map<std::string, int>& counts,
+		                     size_t limit) {
+			std::vector<std::pair<int, std::string>> sorted;
+			for (auto& [name, n]: counts) {
+				sorted.emplace_back(n, name);
+			}
+			std::sort(sorted.rbegin(), sorted.rend());
+			out += fmt::format("  {}:\n", title);
+			for (size_t i = 0; i < std::min(limit, sorted.size()); i++) {
+				out += fmt::format("    {:5.1f}%  {}\n",
+				                   100.0 * sorted[i].first / static_cast<double>(t->samples.size()),
+				                   sorted[i].second);
+			}
+		};
+		print_top("self", self_counts, 15);
+		print_top("inclusive", total_counts, 25);
+		print_top("stacks", stack_counts, 8);
+	}
+	for (auto& t: threads) {
+		CloseHandle(t.handle);
+	}
+}
+
 // Runs the sampler on its own thread so a problem inside it cannot stop the report.
 void ReportThreadSamplesBounded(std::string& out) {
 	struct Shared {
@@ -701,6 +879,10 @@ void ReportThreadSamplesBounded(std::string& out) {
 	out += "Thread sampling is only implemented on Windows\n";
 }
 
+void ProfileBusyThreads(std::string& out, int /*duration_ms*/) {
+	out += "Profiling is only implemented on Windows\n";
+}
+
 #endif
 
 void WriteReport(const std::string& report) {
@@ -720,6 +902,7 @@ void WatchdogThread() {
 	uint32_t reports_in_stall = 0;
 	uint32_t total_reports    = 0;
 	const int64_t start_ns    = NowNs();
+	int64_t  next_profile_ns  = 40'000'000'000;
 	int64_t  perf_ns          = start_ns;
 	uint64_t perf_flips       = g_flips.load(std::memory_order_relaxed);
 	uint64_t perf_progress    = last_progress;
@@ -753,6 +936,14 @@ void WatchdogThread() {
 			continue;
 		}
 		const auto stalled = now - last_change_ns;
+		if (stalled < StallReportNs && now - start_ns >= next_profile_ns) {
+			next_profile_ns += 60'000'000'000;
+			std::string profile = fmt::format("\n=== profile at t={:.0f}s ===\n",
+			                                  static_cast<double>(now - start_ns) / 1e9);
+			ProfileBusyThreads(profile, 3000);
+			AppendDiagnostic("kyty_profile.txt", profile);
+			continue;
+		}
 		if (stalled < StallReportNs || total_reports >= MaxReports * 4 ||
 		    reports_in_stall >= MaxReports ||
 		    (reports_in_stall != 0 && now - last_report_ns < RepeatReportNs)) {

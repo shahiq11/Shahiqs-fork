@@ -12,7 +12,10 @@
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
 #include <numeric>
+#include <span>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -195,6 +198,82 @@ void NullMinorityNumericClasses(std::vector<DescriptorValue>&        descriptors
 	}
 }
 
+// Broad-heap image tables are rebuilt from guest memory on every dispatch and grow while a game
+// streams textures. Sort a table's candidates into groups of one binding type (dimension, cube,
+// mip count) and pad each group with null candidates to a power-of-two capacity. The shader then
+// indexes one descriptor array per group instead of switching over every texture, and its
+// specialization stays the same while the table grows within that capacity. Only runtime data
+// (the ordinal mapping in the flattened SRT and the bound descriptors) changes.
+void CanonicalizeBoundedImageTable(const ImageResource& base, ResourceSnapshot& snapshot,
+                                   std::vector<ResourceSpecialization::Image>& specializations,
+                                   uint32_t root, size_t children_begin) {
+	constexpr size_t MinGroupCapacity = 16;
+	auto&            descriptors      = snapshot.images;
+	const size_t     children_end     = descriptors.size();
+	if (children_end <= children_begin || specializations.size() != children_end ||
+	    root >= specializations.size() || specializations[root].indirect_root != root ||
+	    specializations[root].indirect_search_iterations != 0u) {
+		return;
+	}
+	auto&      srt            = snapshot.flattened_srt;
+	const auto mapping_offset = specializations[root].indirect_mapping_offset;
+	if (mapping_offset >= srt.size()) return;
+	const auto mapping_count = srt[mapping_offset];
+	if (static_cast<size_t>(mapping_offset) + 1u + mapping_count > srt.size()) return;
+
+	const auto group_key = [&](const DescriptorValue& descriptor) {
+		const auto dimension = DescriptorDimension(descriptor, base.dimension);
+		return (static_cast<uint64_t>(DescriptorIsCube(descriptor)) << 40u) |
+		       (static_cast<uint64_t>(dimension) << 32u) | ImageMipCount(base, descriptor);
+	};
+	std::map<uint64_t, std::vector<size_t>> groups;
+	std::vector<size_t>                     nulls;
+	for (size_t index = children_begin; index < children_end; ++index) {
+		if (NullImageDescriptor(descriptors[index])) {
+			nulls.push_back(index);
+		} else {
+			groups[group_key(descriptors[index])].push_back(index);
+		}
+	}
+	if (groups.empty()) return;
+	// Null candidates take the binding type of the group they follow.
+	auto& first_group = groups.begin()->second;
+	first_group.insert(first_group.end(), nulls.begin(), nulls.end());
+
+	const auto template_spec = specializations[children_begin];
+	DescriptorValue null_value {};
+	null_value.dword_count = descriptors[children_begin].dword_count;
+
+	std::vector<DescriptorValue>                new_descriptors;
+	std::vector<ResourceSpecialization::Image>  new_specializations;
+	std::vector<uint32_t> new_ordinal(children_end - children_begin + 1u, 0u);
+	for (const auto& [key, members]: groups) {
+		(void)key;
+		const size_t capacity = std::max(MinGroupCapacity, std::bit_ceil(members.size()));
+		for (const auto old_index: members) {
+			new_ordinal[old_index - children_begin + 1u] =
+			    static_cast<uint32_t>(new_descriptors.size() + 1u);
+			new_descriptors.push_back(descriptors[old_index]);
+			new_specializations.push_back(specializations[old_index]);
+		}
+		for (size_t pad = members.size(); pad < capacity; ++pad) {
+			new_descriptors.push_back(null_value);
+			new_specializations.push_back(template_spec);
+		}
+	}
+	descriptors.resize(children_begin);
+	descriptors.insert(descriptors.end(), new_descriptors.begin(), new_descriptors.end());
+	specializations.resize(children_begin);
+	specializations.insert(specializations.end(), new_specializations.begin(),
+	                       new_specializations.end());
+	for (uint32_t word = 0; word < mapping_count; ++word) {
+		auto& value = srt[mapping_offset + 1u + word];
+		if (value != 0u && value < new_ordinal.size()) {
+			value = new_ordinal[value];
+		}
+	}
+}
+
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
 	if (descriptor.dword_count != std::size(result.fields)) {
 		return false;
@@ -271,6 +350,41 @@ bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
 	return true;
 }
 
+// Fast 64-bit hash of a word table (four independent lanes keep it memory-bound).
+uint64_t HashWords(std::span<const uint32_t> words) {
+	uint64_t lanes[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull,
+	                     0x27d4eb2f165667c5ull};
+	size_t i = 0;
+	for (; i + 8u <= words.size(); i += 8u) {
+		for (size_t lane = 0; lane < 4u; ++lane) {
+			const uint64_t value = words[i + lane * 2u] |
+			                       (static_cast<uint64_t>(words[i + lane * 2u + 1u]) << 32u);
+			lanes[lane] = (lanes[lane] ^ value) * 0x100000001b3ull;
+			lanes[lane] ^= lanes[lane] >> 31u;
+		}
+	}
+	uint64_t hash = words.size();
+	for (; i < words.size(); ++i) {
+		hash = (hash ^ words[i]) * 0x100000001b3ull;
+	}
+	for (const auto lane: lanes) {
+		hash = (hash ^ lane) * 0x9e3779b97f4a7c15ull;
+		hash ^= hash >> 29u;
+	}
+	return hash;
+}
+
+struct DescriptorValueHash {
+	size_t operator()(const DescriptorValue& value) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull ^ value.dword_count;
+		for (const auto word: value.dwords) {
+			hash = (hash ^ word) * 0x100000001b3ull;
+			hash ^= hash >> 29u;
+		}
+		return static_cast<size_t>(hash);
+	}
+};
+
 bool IsBoundedDescriptorTable(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& indirect) {
 	const auto* table = Source(program, indirect.table_source);
@@ -293,18 +407,22 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& keys = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	// Broad heaps probe every dword offset, so interning must not be quadratic.
+	std::unordered_map<DescriptorValue, uint32_t, DescriptorValueHash> interned;
 	const auto intern_candidate = [&](const DescriptorValue& candidate, uint32_t& ordinal) {
 		ordinal = 0u;
 		if (candidate == descriptors[resource_index]) return true;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
-			if (descriptors.size() >= maximum_resources) return false;
-			descriptors.push_back(candidate);
-			auto child = root_resource;
-			child.indirect_root = resource_index;
-			specializations.push_back(child);
+		if (const auto found = interned.find(candidate); found != interned.end()) {
+			ordinal = found->second;
+			return true;
 		}
+		if (descriptors.size() >= maximum_resources) return false;
+		descriptors.push_back(candidate);
+		auto child = root_resource;
+		child.indirect_root = resource_index;
+		specializations.push_back(child);
+		ordinal = static_cast<uint32_t>(descriptors.size() - children_begin);
+		interned.emplace(candidate, ordinal);
 		return true;
 	};
 	const auto read_keys = [&](const ShaderBufferResource& material, uint64_t first,
@@ -358,20 +476,75 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			descriptors[resource_index] = {.dword_count = dword_count};
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
-			for (uint32_t word = 0; word < keys.size(); ++word) {
-				DescriptorValue candidate {.dword_count = dword_count};
-				std::copy_n(keys.begin() + word, std::min<size_t>(dword_count, keys.size() - word),
-				            candidate.dwords.begin());
-				if (!normalize(candidate)) return false;
-				uint32_t ordinal;
-				if (!intern_candidate(candidate, ordinal)) return false;
-				if (ordinal == 0u) continue;
-				snapshot.flattened_srt.resize(mapping_offset + 2u + word, 0u);
-				snapshot.flattened_srt[mapping_offset + 1u + word] = ordinal;
+			// Scanning every dword of a large heap is expensive and the heap rarely changes
+			// between dispatches: reuse the previous scan when the table bytes are identical.
+			struct ScanKey {
+				const void* plan;
+				uint32_t    resource;
+				uint32_t    dwords;
+				uint64_t    base;
+				uint64_t    size;
+				bool        operator==(const ScanKey&) const = default;
+			};
+			struct ScanKeyHash {
+				size_t operator()(const ScanKey& key) const noexcept {
+					return std::hash<uint64_t> {}(reinterpret_cast<uint64_t>(key.plan) ^
+					                              (key.base * 31u) ^ (uint64_t {key.resource} << 48u) ^
+					                              (key.size << 7u) ^ key.dwords);
+				}
+			};
+			struct ScanResult {
+				uint64_t                     content_hash = 0;
+				bool                         valid        = false;
+				std::vector<DescriptorValue> children;
+				std::vector<uint32_t>        mapping;
+			};
+			static thread_local std::unordered_map<ScanKey, ScanResult, ScanKeyHash> scan_cache;
+			if (scan_cache.size() > 512) scan_cache.clear();
+			const auto content_hash = HashWords(keys);
+			auto& cached = scan_cache[ScanKey {&program, resource_index, dword_count, table_base,
+			                                   table_size}];
+			if (cached.valid && cached.content_hash == content_hash) {
+				if (descriptors.size() + cached.children.size() > maximum_resources) return false;
+				for (const auto& child: cached.children) {
+					descriptors.push_back(child);
+					auto spec = root_resource;
+					spec.indirect_root = resource_index;
+					specializations.push_back(spec);
+				}
+				snapshot.flattened_srt.resize(mapping_offset + 1u + cached.mapping.size(), 0u);
+				std::ranges::copy(cached.mapping, snapshot.flattened_srt.begin() +
+				                                      static_cast<std::ptrdiff_t>(mapping_offset + 1u));
+			} else {
+				for (uint32_t word = 0; word < keys.size(); ++word) {
+					DescriptorValue candidate {.dword_count = dword_count};
+					std::copy_n(keys.begin() + word,
+					            std::min<size_t>(dword_count, keys.size() - word),
+					            candidate.dwords.begin());
+					if (!normalize(candidate)) return false;
+					uint32_t ordinal;
+					if (!intern_candidate(candidate, ordinal)) return false;
+					if (ordinal == 0u) continue;
+					snapshot.flattened_srt.resize(mapping_offset + 2u + word, 0u);
+					snapshot.flattened_srt[mapping_offset + 1u + word] = ordinal;
+				}
+				cached.valid        = true;
+				cached.content_hash = content_hash;
+				cached.children.assign(descriptors.begin() + static_cast<std::ptrdiff_t>(children_begin),
+				                       descriptors.end());
+				cached.mapping.assign(snapshot.flattened_srt.begin() +
+				                          static_cast<std::ptrdiff_t>(mapping_offset + 1u),
+				                      snapshot.flattened_srt.end());
 			}
 			if (descriptors.size() == children_begin) {
 				snapshot.flattened_srt.resize(mapping_offset);
 			} else {
+				// Round the mapping length up so tables that gain entries at higher offsets do not
+				// move later mappings (their offsets are part of the shader specialization).
+				const auto used    = snapshot.flattened_srt.size() - mapping_offset - 1u;
+				const auto rounded = std::min<size_t>(
+				    keys.size(), std::max<size_t>(1024u, std::bit_ceil(used)));
+				snapshot.flattened_srt.resize(mapping_offset + 1u + std::max(used, rounded), 0u);
 				snapshot.flattened_srt[mapping_offset] =
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
 				auto& root = specializations[resource_index];
@@ -657,18 +830,24 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
 		};
+		// Null candidates take the type of the preceding typed candidate, so that padding keeps
+		// a group of one binding type contiguous (see CanonicalizeBoundedImageTable).
+		uint32_t last_typed = exemplar;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
 				continue;
 			}
 			if (NullImageDescriptor(snapshot.images[candidate])) {
-				image.numeric_class     = image_class.numeric_class;
-				image.dimension         = image_class.dimension;
-				image.mip_count         = image_class.mip_count;
-				image.conversion_format = image_class.conversion_format;
-				image.shader_swizzle    = image_class.shader_swizzle;
-				image.cube              = image_class.cube;
+				const auto source_class = specialization.images[last_typed];
+				image.numeric_class     = source_class.numeric_class;
+				image.dimension         = source_class.dimension;
+				image.mip_count         = source_class.mip_count;
+				image.conversion_format = source_class.conversion_format;
+				image.shader_swizzle    = source_class.shader_swizzle;
+				image.cube              = source_class.cube;
+			} else {
+				last_typed = candidate;
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
@@ -1271,6 +1450,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			const auto children_begin = snapshot.images.size();
 			if (!MaterializeIndirectDescriptor(
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
@@ -1285,6 +1465,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (bounded_table && image.resource_class == ImageResourceClass::Sampled &&
 			    !image.atomic) {
 				NullMinorityNumericClasses(snapshot.images, specialization.images, i);
+			}
+			if (bounded_table) {
+				CanonicalizeBoundedImageTable(image, snapshot, specialization.images, i,
+				                              children_begin);
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
