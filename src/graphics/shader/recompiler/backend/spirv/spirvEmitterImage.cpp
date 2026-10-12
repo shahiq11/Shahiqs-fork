@@ -976,26 +976,35 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
 		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
-			           const auto pointer      = state.builder.AllocateId();
-			           const auto pointer_type =
-			               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,
-			                                  image.atomic64 ? TypeU64(state) : TypeU32(state));
-			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
-			                                     ImageDescriptorPointer(state, mem.resource),
-			                                     CoordU32(ctx, mem, *address, dimension),
-			                                     ConstantU32(state, 0));
-			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
-			               op == IR::ValueOpcode::ImageAtomicFMax32) {
-				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
-				                               [&](uint32_t old) {
-					                               return EmitFloatAtomicReplacement(
-					                                   state, old, ctx.Arg(inst, 2),
-					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
-				                               });
-			           }
-			           const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
-			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
-			           return old;
+			           // Indirect image tables select the candidate run at runtime.
+			           return EmitImageAccess(ctx, inst, result_type, [&](uint32_t resource,
+			                                                              uint32_t array_index) {
+				           const auto pointer      = state.builder.AllocateId();
+				           const auto pointer_type =
+				               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,
+				                                  image.atomic64 ? TypeU64(state) : TypeU32(state));
+				           state.builder.AddFunction(
+				               spv::OpImageTexelPointer, pointer_type, pointer,
+				               ImageDescriptorPointer(state, resource, 0u, array_index),
+				               CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0));
+				           if (array_index != 0u) {
+					           DecorateNonUniformDescriptor(state, pointer);
+					           state.builder.RequireCapability(
+					               spv::CapabilityStorageImageArrayNonUniformIndexing);
+				           }
+				           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
+				               op == IR::ValueOpcode::ImageAtomicFMax32) {
+					           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
+					                               [&](uint32_t old) {
+						                               return EmitFloatAtomicReplacement(
+						                                   state, old, ctx.Arg(inst, 2),
+						                                   op == IR::ValueOpcode::ImageAtomicFMax32);
+					                               });
+				           }
+				           const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
+				           return old;
+			           });
 		           }));
 		return;
 	}

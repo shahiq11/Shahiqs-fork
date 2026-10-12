@@ -137,14 +137,12 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 	}
 }
 
-namespace {
 void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id) {
 	state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 	state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 	state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
 	state.builder.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
 }
-} // namespace
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
@@ -155,6 +153,9 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	                          image, pointer);
 	if (array_index != 0u) {
 		DecorateNonUniformDescriptor(state, image);
+		if (state.program.info.images[resource].resource_class == IR::ImageResourceClass::Storage) {
+			state.builder.RequireCapability(spv::CapabilityStorageImageArrayNonUniformIndexing);
+		}
 	}
 	return image;
 }

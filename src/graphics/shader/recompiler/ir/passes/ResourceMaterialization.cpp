@@ -1692,15 +1692,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			// Indirect image tables support every non-atomic image operation (the emitter selects
-			// the candidate run at runtime); atomics on a table are not implemented yet.
-			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageRead &&
-			        inst.GetOpcode() != ValueOpcode::ImageWrite &&
-			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
-			        inst.GetOpcode() != ValueOpcode::ImageQueryLod);
+			// Indirect image tables support every image operation: the emitter selects the
+			// candidate run at runtime (EmitImageAccess).
 		}
 	}
 	for (auto& memory: memory_info) {
