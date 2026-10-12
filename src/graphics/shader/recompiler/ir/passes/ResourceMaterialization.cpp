@@ -13,12 +13,145 @@
 #include <fmt/format.h>
 #include <functional>
 #include <map>
+#include <mutex>
+#include <atomic>
 #include <numeric>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace ImageResidency {
+
+// Feedback bits of one broad texture heap: bit `base + word` is set by shaders that read the
+// heap slot at `word` while it was not materialized. Bits stay set (textures stay listed).
+struct Region {
+	uint32_t              base       = 0;
+	uint32_t              length     = 0;
+	uint64_t              generation = 0;
+	std::vector<uint64_t> used;
+
+	[[nodiscard]] bool Used(uint32_t word) const {
+		return word < length && ((used[word >> 6u] >> (word & 63u)) & 1u) != 0u;
+	}
+};
+
+namespace {
+
+struct State {
+	std::mutex                                         mutex;
+	std::map<std::pair<uint64_t, uint32_t>, Region>    regions;
+	uint32_t                                           next_bit = 32; // Bit 0 stays unused.
+	bool                                               exhausted_reported = false;
+};
+
+std::atomic<bool> g_enabled {false};
+
+State& GetState() {
+	static State state;
+	return state;
+}
+
+std::unique_lock<std::mutex> Lock() {
+	return std::unique_lock<std::mutex>(GetState().mutex);
+}
+
+// Caller holds Lock(). Returns nullptr when the feedback area is full; such heaps are
+// materialized completely, as without residency.
+const Region* AcquireRegion(uint64_t table_base, uint32_t length) {
+	auto& state = GetState();
+	const auto key = std::make_pair(table_base, length);
+	if (const auto found = state.regions.find(key); found != state.regions.end()) {
+		return &found->second;
+	}
+	if (length == 0u || length > ImageResidencyFeedbackBits ||
+	    state.next_bit > ImageResidencyFeedbackBits - length) {
+		if (!state.exhausted_reported) {
+			state.exhausted_reported = true;
+			std::printf("Texture residency: feedback area full; new heaps load every texture\n");
+		}
+		return nullptr;
+	}
+	auto& region  = state.regions[key];
+	region.base   = state.next_bit;
+	region.length = length;
+	region.used.assign((length + 63u) / 64u, 0u);
+	state.next_bit = (state.next_bit + length + 31u) & ~31u;
+	return &region;
+}
+
+} // namespace
+
+void SetEnabled(bool enabled) noexcept {
+	g_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool Enabled() noexcept {
+	return g_enabled.load(std::memory_order_relaxed);
+}
+
+uint32_t FeedbackWords() {
+	auto& state = GetState();
+	std::scoped_lock lock(state.mutex);
+	return state.next_bit / 32u;
+}
+
+void MarkUsed(std::span<const uint32_t> words) {
+	auto&            state = GetState();
+	std::scoped_lock lock(state.mutex);
+	size_t           added = 0;
+	for (auto& [key, region]: state.regions) {
+		(void)key;
+		bool changed = false;
+		for (uint32_t word = 0; word < region.length;) {
+			const uint32_t bit   = region.base + word;
+			const uint32_t index = bit >> 5u;
+			if (index >= words.size()) break;
+			const uint32_t shift = bit & 31u;
+			const uint32_t count = std::min(32u - shift, region.length - word);
+			uint32_t       chunk = words[index] >> shift;
+			if (count < 32u) chunk &= (1u << count) - 1u;
+			while (chunk != 0u) {
+				const uint32_t slot = word + static_cast<uint32_t>(std::countr_zero(chunk));
+				chunk &= chunk - 1u;
+				auto&          entry = region.used[slot >> 6u];
+				const uint64_t mask  = uint64_t {1} << (slot & 63u);
+				if ((entry & mask) == 0u) {
+					entry |= mask;
+					changed = true;
+					++added;
+				}
+			}
+			word += count;
+		}
+		if (changed) ++region.generation;
+	}
+	if (added != 0u) {
+		static std::atomic<size_t> total {0};
+		const auto                 sum = total.fetch_add(added) + added;
+		static std::atomic<size_t> reported {0};
+		if (sum >= reported.load() * 2u + 64u) {
+			reported.store(sum);
+			std::printf("Texture residency: %zu heap texture slot(s) requested by shaders so far\n",
+			            sum);
+		}
+	}
+}
+
+} // namespace ImageResidency
+
+bool UsesImageResidencyFeedback(const ShaderInfo& info) {
+	if (!ImageResidency::Enabled()) return false;
+	for (uint32_t index = 0; index < info.images.size(); ++index) {
+		const auto& image = info.images[index];
+		if (image.indirect_root == index && image.indirect_search_iterations == 0u &&
+		    image.indirect_resources.size() >= 2u) {
+			return true;
+		}
+	}
+	return false;
+}
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
@@ -478,9 +611,24 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			// no material selector or unused table field is interpreted on the CPU.
 			keys.resize(table_size / 4u);
 			if (!ReadScalarTable(table_base, table_size, 0u, runtime, keys)) return false;
-			const auto mapping_offset = snapshot.flattened_srt.size();
+			// With residency feedback, two header words (feedback base bit and slot count)
+			// precede the mapping; see ImageResidency.
+			const auto header_offset = snapshot.flattened_srt.size();
+			const bool feedback      = ImageResidency::Enabled();
+			const auto mapping_offset =
+			    header_offset + (feedback ? ImageResidencyHeaderWords : 0u);
 			descriptors[resource_index] = {.dword_count = dword_count};
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			std::unique_lock<std::mutex> residency_lock;
+			const ImageResidency::Region* region = nullptr;
+			if (feedback) {
+				residency_lock = ImageResidency::Lock();
+				region = ImageResidency::AcquireRegion(table_base, static_cast<uint32_t>(keys.size()));
+				if (region != nullptr) {
+					snapshot.flattened_srt[header_offset]      = region->base;
+					snapshot.flattened_srt[header_offset + 1u] = region->length;
+				}
+			}
 			// Scanning every dword of a large heap is expensive and the heap rarely changes
 			// between dispatches: reuse the previous scan when the table bytes are identical.
 			struct ScanKey {
@@ -500,6 +648,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			};
 			struct ScanResult {
 				uint64_t                     content_hash = 0;
+				const void*                  region       = nullptr;
+				uint64_t                     generation   = 0;
 				bool                         valid        = false;
 				std::vector<DescriptorValue> children;
 				std::vector<uint32_t>        mapping;
@@ -507,9 +657,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			static thread_local std::unordered_map<ScanKey, ScanResult, ScanKeyHash> scan_cache;
 			if (scan_cache.size() > 512) scan_cache.clear();
 			const auto content_hash = HashWords(keys);
+			const uint64_t generation = region != nullptr ? region->generation : 0u;
 			auto& cached = scan_cache[ScanKey {&program, resource_index, dword_count, table_base,
 			                                   table_size}];
-			if (cached.valid && cached.content_hash == content_hash) {
+			if (cached.valid && cached.content_hash == content_hash && cached.region == region &&
+			    cached.generation == generation) {
 				if (descriptors.size() + cached.children.size() > maximum_resources) return false;
 				for (const auto& child: cached.children) {
 					descriptors.push_back(child);
@@ -533,6 +685,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				const uint32_t word_bits    = align_bits > 2u ? std::min(align_bits - 2u, 16u) : 0u;
 				const uint32_t word_mask    = (1u << word_bits) - 1u;
 				const uint32_t word_residue = (indirect.table_align_residue >> 2u) & word_mask;
+				// A heap lists every texture the game has loaded; materialize only the slots a
+				// shader has read (plus the first texture, so the table keeps its type). The
+				// others read as null until the shader's feedback arrives, usually a frame later.
+				bool   seeded   = false;
+				size_t textures = 0;
 				for (uint32_t word = 0; word < keys.size(); ++word) {
 					if ((word & word_mask) != word_residue) continue;
 					DescriptorValue candidate {.dword_count = dword_count};
@@ -540,21 +697,36 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					            std::min<size_t>(dword_count, keys.size() - word),
 					            candidate.dwords.begin());
 					if (!normalize(candidate)) return false;
+					if (region != nullptr && !(candidate == descriptors[resource_index])) {
+						++textures;
+						if (seeded && !region->Used(word)) continue;
+						seeded = true;
+					}
 					uint32_t ordinal;
 					if (!intern_candidate(candidate, ordinal)) return false;
 					if (ordinal == 0u) continue;
 					snapshot.flattened_srt.resize(mapping_offset + 2u + word, 0u);
 					snapshot.flattened_srt[mapping_offset + 1u + word] = ordinal;
 				}
-				static thread_local std::unordered_set<const void*> reported;
-				if (reported.size() < 4096 && reported.insert(&program).second) {
-					std::printf("Broad image heap: %zu dwords, probing every %u dword(s) at +%u, "
-					            "%zu distinct texture(s)\n",
-					            keys.size(), word_mask + 1u, word_residue,
-					            descriptors.size() - children_begin);
+				static thread_local std::unordered_map<const void*, size_t> reported;
+				const auto distinct = descriptors.size() - children_begin;
+				if (reported.size() < 4096) {
+					auto& last = reported[&program];
+					if (last == 0u || distinct >= last * 2u) {
+						last = std::max<size_t>(distinct, 1u);
+						const auto on_demand =
+						    region != nullptr ? fmt::format(" of {} in the heap (loaded on demand)", textures)
+						                      : std::string {};
+						std::printf("Broad image heap: %zu dwords, probing every %u dword(s) at +%u, "
+						            "%zu distinct texture(s)%s\n",
+						            keys.size(), word_mask + 1u, word_residue, distinct,
+						            on_demand.c_str());
+					}
 				}
 				cached.valid        = true;
 				cached.content_hash = content_hash;
+				cached.region       = region;
+				cached.generation   = generation;
 				cached.children.assign(descriptors.begin() + static_cast<std::ptrdiff_t>(children_begin),
 				                       descriptors.end());
 				cached.mapping.assign(snapshot.flattened_srt.begin() +
@@ -562,7 +734,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				                      snapshot.flattened_srt.end());
 			}
 			if (descriptors.size() == children_begin) {
-				snapshot.flattened_srt.resize(mapping_offset);
+				snapshot.flattened_srt.resize(header_offset);
 			} else {
 				// Round the mapping length up so tables that gain entries at higher offsets do not
 				// move later mappings (their offsets are part of the shader specialization).

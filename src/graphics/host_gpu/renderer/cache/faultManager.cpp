@@ -6,12 +6,14 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -20,16 +22,29 @@ namespace {
 constexpr size_t MaxPageFaults    = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 
+namespace IR = ShaderRecompiler::IR;
+constexpr uint64_t PageFaultBitBytes = BufferCache::CACHING_NUMPAGES / 8;
+constexpr uint64_t ResidencyOffset   = uint64_t {IR::ImageResidencyFeedbackWordOffset} * 4u;
+constexpr uint64_t ResidencyBytes    = IR::ImageResidencyFeedbackBits / 8u;
+static_assert(ResidencyOffset == PageFaultBitBytes,
+              "texture residency feedback must follow the page-fault bits");
+
 } // namespace
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     PageFaultBitBytes + ResidencyBytes),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
+                        MaxPendingFaults * PageFaultAreaSize),
+      m_residency_download(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+                           MaxPendingFaults * ResidencyBytes) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+	SetVulkanObjectNameF(m_graphics.device, m_residency_download.Handle(),
+	                     "Texture Residency Readback");
+	// Load broad-heap textures on demand. Set before any shader resource is materialized.
+	IR::ImageResidency::SetEnabled(true);
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -66,6 +81,46 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
+}
+
+void FaultManager::ProcessImageResidency() {
+	if (!IR::ImageResidency::Enabled()) {
+		return;
+	}
+	if (!m_residency_cleared) {
+		// Device memory starts undefined; stray bits would only load extra textures.
+		m_residency_cleared = true;
+		m_fault_buffer.Fill(ResidencyOffset, ResidencyBytes, 0u);
+		return;
+	}
+	const auto words = std::min<uint64_t>(IR::ImageResidency::FeedbackWords(), ResidencyBytes / 4u);
+	if (words == 0u) {
+		return;
+	}
+	if (const auto wait_tick = m_residency_areas[m_residency_area]; wait_tick != 0) {
+		m_scheduler.Wait(wait_tick);
+		m_scheduler.PopPendingOperations();
+	}
+	const auto area   = m_residency_area;
+	const auto offset = area * ResidencyBytes;
+	const auto bytes  = words * 4u;
+	m_residency_download.CopyFrom(m_scheduler.Current(), m_fault_buffer, ResidencyOffset, offset,
+	                              bytes, vk::AccessFlagBits::eShaderWrite |
+	                                         vk::AccessFlagBits::eMemoryWrite,
+	                              vk::AccessFlagBits::eHostRead,
+	                              vk::AccessFlagBits::eShaderRead |
+	                                  vk::AccessFlagBits::eShaderWrite,
+	                              vk::AccessFlagBits::eHostRead);
+	m_scheduler.DeferOperation([this, area, offset, bytes] {
+		m_residency_download.Invalidate(offset, bytes);
+		const auto* mapped = m_residency_download.Mapped().data() + offset;
+		std::vector<uint32_t> copy(bytes / 4u);
+		std::memcpy(copy.data(), mapped, bytes);
+		IR::ImageResidency::MarkUsed(copy);
+		m_residency_areas[area] = 0;
+	});
+	m_residency_areas[m_residency_area++] = m_scheduler.CurrentTick();
+	m_residency_area %= MaxPendingFaults;
 }
 
 FaultManager::~FaultManager() {

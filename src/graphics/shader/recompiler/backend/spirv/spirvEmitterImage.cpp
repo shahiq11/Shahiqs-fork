@@ -619,6 +619,54 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return PackImageTexel(ctx, mem, texel);
 }
 
+// Broad heaps materialize textures on demand (IR::ImageResidency): a read of a heap slot that
+// resolved to no texture sets the slot's bit in the fault buffer, so the host loads it.
+void EmitResidencyFeedback(EmitterState& state, uint32_t key, uint32_t selected,
+                           uint32_t mapping_offset) {
+	const auto Element = [&](uint32_t variable, uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                          variable, ConstantU32(state, 0), index);
+		return pointer;
+	};
+	const auto Load = [&](uint32_t pointer) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto word =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), key, ConstantU32(state, 2u));
+	const auto base = Load(Element(state.flattened_srt_variable,
+	                               ConstantU32(state, mapping_offset - IR::ImageResidencyHeaderWords)));
+	const auto length =
+	    Load(Element(state.flattened_srt_variable,
+	                 ConstantU32(state, mapping_offset - IR::ImageResidencyHeaderWords + 1u)));
+	const auto miss = Binary(
+	    state, spv::OpLogicalAnd, TypeBool(state),
+	    Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, 0u)),
+	    Binary(state, spv::OpULessThan, TypeBool(state), word, length));
+	EmitIfCondition(state, miss, [&] {
+		const auto bit = Binary(state, spv::OpIAdd, TypeU32(state), base, word);
+		const auto index = Binary(
+		    state, spv::OpIAdd, TypeU32(state),
+		    ConstantU32(state, IR::ImageResidencyFeedbackWordOffset),
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), bit, ConstantU32(state, 5u)));
+		const auto mask = Binary(
+		    state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1u),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), bit, ConstantU32(state, 31u)));
+		const auto pointer = Element(state.fault_buffer_variable, index);
+		const auto value   = Load(pointer);
+		const auto unset   = Binary(state, spv::OpIEqual, TypeBool(state),
+		                            Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, mask),
+		                            ConstantU32(state, 0u));
+		// A lost race only delays the request: the slot stays unloaded and reports again.
+		EmitIfCondition(state, unset, [&] {
+			state.builder.AddFunction(spv::OpStore, pointer,
+			                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, mask));
+		});
+	});
+}
+
 // Emits an image operation for a direct image, or for every typed run of an indirect image
 // table selected at runtime. `emit(resource, array_index)` may return a value or void.
 template <typename Emit>
@@ -643,6 +691,11 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto selected = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	if (image.indirect_search_iterations == 0u && state.fault_buffer_variable != 0u &&
+	    IR::ImageResidency::Enabled() &&
+	    image.indirect_mapping_offset >= IR::ImageResidencyHeaderWords) {
+		EmitResidencyFeedback(state, key, selected, image.indirect_mapping_offset);
+	}
 	// A run is a range of ordinals whose descriptors are evenly spaced in one binding array:
 	// ordinal k uses slots [slot_bias + k * stride, + stride), one slot per mip for dynamic-mip
 	// images. Broad-heap tables sort candidates by binding type and mip count (see

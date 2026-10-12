@@ -673,6 +673,10 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+void BufferCache::ProcessImageResidency() {
+	m_fault_manager.ProcessImageResidency();
+}
+
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);

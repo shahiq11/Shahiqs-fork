@@ -317,6 +317,14 @@ enum class DescriptorBindingKind : uint32_t {
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 
+// Broad texture heap residency feedback shares the fault buffer: shaders set one bit per heap
+// slot they read while it was not materialized. The bits follow the BDA page-fault bits
+// ((1 TiB + 512 GiB) / 16 KiB pages / 32 bits per word).
+inline constexpr uint32_t ImageResidencyFeedbackWordOffset = 3u << 20u;
+inline constexpr uint32_t ImageResidencyFeedbackBits       = 1u << 22u;
+// Bounded heap mappings are preceded by two flattened-SRT words: feedback base bit and length.
+inline constexpr uint32_t ImageResidencyHeaderWords = 2u;
+
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;

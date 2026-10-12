@@ -21,6 +21,8 @@ public:
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
+	// Reads back broad texture heap residency requests (see IR::ImageResidency).
+	void                  ProcessImageResidency();
 
 private:
 	GraphicContext&                            m_graphics;
@@ -30,6 +32,10 @@ private:
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	Buffer                                     m_residency_download;
+	std::array<uint64_t, MaxPendingFaults>      m_residency_areas {};
+	uint32_t                                   m_residency_area    = 0;
+	bool                                       m_residency_cleared = false;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;

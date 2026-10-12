@@ -50,6 +50,23 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
+// On-demand textures for broad heaps. A heap lists every texture a game has loaded, often
+// thousands, while a frame reads few of them. When enabled (by the renderer, before any shader is
+// materialized), a heap slot is materialized only after a shader has read it: shaders set the
+// slot's bit in the fault buffer (ImageResidencyFeedbackWordOffset) and the renderer passes the
+// bits back through MarkUsed.
+namespace ImageResidency {
+void                   SetEnabled(bool enabled) noexcept;
+[[nodiscard]] bool     Enabled() noexcept;
+// Number of leading feedback words that belong to known heaps.
+[[nodiscard]] uint32_t FeedbackWords();
+// Merges a copy of the leading feedback words.
+void                   MarkUsed(std::span<const uint32_t> words);
+} // namespace ImageResidency
+
+// True when the shader reads a broad heap and must bind the fault buffer for residency feedback.
+[[nodiscard]] bool UsesImageResidencyFeedback(const ShaderInfo& info);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_ */
