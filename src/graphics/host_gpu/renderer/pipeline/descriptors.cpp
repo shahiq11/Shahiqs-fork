@@ -31,6 +31,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
@@ -46,6 +47,18 @@
 #endif
 
 namespace Libs::Graphics {
+
+// Specialization reads (descriptor tables read on the CPU) are refreshed before every dispatch
+// or draw, so an overlapping shader write can only matter inside that same dispatch. Broad
+// descriptor heaps commonly share a buffer with unrelated writable data (PPSA03671), so report the
+// overlap a few times instead of aborting.
+static void WarnSpecializationOverlap(const char* what) {
+	static std::atomic<uint32_t> warnings {0};
+	if (warnings.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("Warning: %s (continuing; descriptor tables are refreshed per dispatch)\n", what);
+		LOGF("Warning: %s\n", what);
+	}
+}
 
 namespace {
 
@@ -781,7 +794,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
 							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
+								WarnSpecializationOverlap("scalar resource reads overlap a shader buffer write");
 							}
 						}
 					}
@@ -953,7 +966,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (reads.empty()) continue;
 		for (const auto* writer: prepared_bindings) {
 			if (writer->runtime->program->has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+				WarnSpecializationOverlap("scalar resource reads cannot be proven disjoint from shader address writes");
 			}
 		}
 		for (const auto [address, size]: reads) {
@@ -965,7 +978,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                          image->info.metadata.range}) {
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+						WarnSpecializationOverlap("scalar resource reads overlap an image or attachment write");
 					}
 				}
 			}
@@ -976,7 +989,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						WarnSpecializationOverlap("scalar resource reads overlap a shader buffer write");
 					}
 				}
 			}
