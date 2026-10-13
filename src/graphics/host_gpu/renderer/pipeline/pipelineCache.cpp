@@ -2,6 +2,7 @@
 #include "kernel/hangWatchdog.h"
 
 #include "common/assert.h"
+#include "common/recoverable.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -30,6 +31,8 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <map>
+#include <set>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -419,9 +422,53 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// Returns an empty program (the caller skips the draw or dispatch) instead of stopping the
+	// emulator when a shader cannot be translated, linked, materialized or compiled. Translation
+	// and compilation failures are permanent for the shader; data-dependent ones are retried.
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		int stage_tag = 0;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage_tag = static_cast<int>(input_info.logical_stage);
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage_tag = static_cast<int>(ShaderType::Pixel);
+		} else {
+			stage_tag = static_cast<int>(ShaderType::Compute);
+		}
+		const auto key = std::make_pair(stage_tag, params.hash);
+		if (broken.contains(key)) return {};
+		ShaderProgram result;
+		std::string   error;
+		const auto    activity_depth = Kernel::HangWatchdog::CurrentActivityDepth();
+		const auto    cursor         = push_data_cursor;
+		phase                        = "lookup";
+		if (Common::RunRecoverable(
+		        [&] { result = GetUnchecked(params, input_info, push_data_cursor); }, &error)) {
+			return result;
+		}
+		Kernel::HangWatchdog::RestoreActivityDepth(activity_depth);
+		push_data_cursor = cursor;
+		input_info.stage = {};
+		const std::string_view failed = phase;
+		const bool permanent = failed == "translate" || failed == "compile";
+		if (permanent) broken.insert(key);
+		auto& reports = skip_reports[key];
+		if (reports++ < 3u) {
+			const auto text = fmt::format(
+			    "Skipping {}draws/dispatches of shader {:016x} (stage {}): {} failed: {}\n",
+			    permanent ? "all " : "these ", params.hash, stage_tag, failed, error);
+			std::printf("%s", text.c_str());
+			std::fflush(stdout);
+			Kernel::HangWatchdog::AppendDiagnostic("kyty_shader_log.txt", text);
+			Kernel::HangWatchdog::AppendDiagnostic("kyty_skipped_shaders.txt", text);
+		}
+		return {};
+	}
+
+	template <typename InputInfo>
+	ShaderProgram GetUnchecked(const ShaderParams& params, InputInfo& input_info,
+	                           uint32_t& push_data_cursor) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -452,9 +499,12 @@ struct PipelineCache::ProgramCache {
 			auto& cached = entry->second;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
+				phase          = "link";
 				source_changed = cached.RefreshCallSource(runtime);
+				phase          = "materialize";
 				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
 			} else {
+				phase       = "materialize";
 				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
 			}
 			if (permutation != nullptr) {
@@ -508,6 +558,7 @@ struct PipelineCache::ProgramCache {
 		KeepGuestShader(stage_name, options.shader_hash, params.code);
 		Kernel::HangWatchdog::Activity watch_shader("shader translate", options.shader_hash,
 		                                            static_cast<uint64_t>(stage));
+		phase = "translate";
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
@@ -528,10 +579,12 @@ struct PipelineCache::ProgramCache {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			Kernel::HangWatchdog::Activity watch_res("materialize resources");
+			phase = "materialize";
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		} else if (source_changed) {
+			phase = "materialize";
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -552,6 +605,7 @@ struct PipelineCache::ProgramCache {
 			why = "same specialization, different push-data start or function code";
 		}
 		const auto compile_start = std::chrono::steady_clock::now();
+		phase = "compile";
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
@@ -603,6 +657,10 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	// Shaders that cannot be used (see Get) and how often each skip was reported.
+	std::set<std::pair<int, uint64_t>>                          broken;
+	std::map<std::pair<int, uint64_t>, uint32_t>                skip_reports;
+	const char*                                                 phase = "lookup";
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -820,8 +878,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1u) < 8u) {
+				std::printf("Skipping draw: mesh shader exceeds host limits: threads=%u vertices=%u "
+				            "primitives=%u LDS=%u\n",
+				            host_threads, mesh.max_vertices, mesh.max_primitives,
+				            mesh.lds_size_dwords);
+			}
+			return {};
 		}
 	}
 	ShaderParams pixel_params;
@@ -888,9 +952,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		// An unusable shader skips the draw (see ProgramCache::Get).
+		if (!result.pixel) return {};
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (!result.vertex[i]) return {};
 	}
 	return result;
 }

@@ -175,6 +175,17 @@ Activity::~Activity() {
 	}
 }
 
+uint32_t CurrentActivityDepth() noexcept {
+	return t_slot != nullptr ? t_slot->activity_depth.load(std::memory_order_relaxed) : 0u;
+}
+
+void RestoreActivityDepth(uint32_t depth) noexcept {
+	if (t_slot != nullptr &&
+	    t_slot->activity_depth.load(std::memory_order_relaxed) > depth) {
+		t_slot->activity_depth.store(depth, std::memory_order_release);
+	}
+}
+
 void SetCurrentThreadName(const char* name) noexcept {
 	auto* slot = CurrentSlot();
 	if (slot != nullptr) {

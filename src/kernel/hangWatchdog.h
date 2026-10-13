@@ -41,6 +41,11 @@ private:
 	bool m_pushed = false;
 };
 
+// Activity nesting of the current thread. After a recovered fatal error (Common::RunRecoverable)
+// skipped Activity destructors, RestoreActivityDepth drops the abandoned entries.
+uint32_t CurrentActivityDepth() noexcept;
+void     RestoreActivityDepth(uint32_t depth) noexcept;
+
 // Appends a line to a diagnostics file in the working directory (thread safe).
 void AppendDiagnostic(const char* file_name, const std::string& text);
 
