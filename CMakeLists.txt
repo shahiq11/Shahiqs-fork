@@ -779,6 +779,9 @@ set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
 		"/DYNAMICBASE:NO"
+		# Recompiling very large guest shaders recurses deeply; the 1 MB default thread stack
+		# overflowed (the process vanished without a report). Reserve 64 MB per thread.
+		"/STACK:67108864"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"

@@ -123,6 +123,7 @@ void CopyName(char* dst, size_t size, const char* src) {
 
 void WatchdogThread();
 void InstallCrashReporter();
+void ReportStackOverflowIfAny();
 
 } // namespace
 
@@ -1021,7 +1022,44 @@ std::string CurrentStackSummaryImpl() {
 	return out;
 }
 
+// A stack overflow leaves the faulting thread no room to format a report, so its handler only
+// hands the exception to the watchdog thread and waits for the report to be written.
+std::atomic<EXCEPTION_POINTERS*> g_overflow {nullptr};
+std::atomic<DWORD>               g_overflow_tid {0};
+std::atomic<bool>                g_overflow_reported {false};
+
+LONG WINAPI StackOverflowHandler(EXCEPTION_POINTERS* pointers) {
+	if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW ||
+	    g_crash_reported.test_and_set()) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	g_overflow_tid.store(GetCurrentThreadId());
+	g_overflow.store(pointers);
+	for (int i = 0; i < 1000 && !g_overflow_reported.load(); i++) {
+		Sleep(10);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void ReportStackOverflowIfAny() {
+	auto* pointers = g_overflow.load();
+	if (pointers == nullptr || g_overflow_reported.load()) return;
+	const auto tid = g_overflow_tid.load();
+	std::string guest;
+	for (uint32_t i = 0; i < std::min(g_slot_count.load(), MaxSlots); i++) {
+		if (g_slots[i].host_tid.load() == tid) guest = g_slots[i].thread_name;
+	}
+	std::string out = fmt::format(
+	    "\n=== Kyty crash: stack overflow on host thread {} (guest=\"{}\") at 0x{:x} ===\n", tid,
+	    guest, pointers->ContextRecord->Rip);
+	out += DescribeCrashStack(*pointers->ContextRecord);
+	out += "=== end of crash report ===\n";
+	WriteCrashReport(out);
+	g_overflow_reported.store(true);
+}
+
 void InstallCrashReporter() {
+	AddVectoredExceptionHandler(1, StackOverflowHandler);
 	SetUnhandledExceptionFilter(CrashFilter);
 	std::signal(SIGABRT, AbortHandler);
 }
@@ -1037,6 +1075,8 @@ void ProfileBusyThreads(std::string& out, int /*duration_ms*/) {
 }
 
 void InstallCrashReporter() {}
+
+void ReportStackOverflowIfAny() {}
 
 std::string CurrentStackSummaryImpl() {
 	return {};
@@ -1067,7 +1107,10 @@ void WatchdogThread() {
 	uint64_t perf_progress    = last_progress;
 
 	for (;;) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		for (int i = 0; i < 10; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			ReportStackOverflowIfAny();
+		}
 		const auto now      = NowNs();
 		if (now - perf_ns >= 5'000'000'000) {
 			const auto flips    = g_flips.load(std::memory_order_relaxed);
