@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +122,7 @@ void CopyName(char* dst, size_t size, const char* src) {
 }
 
 void WatchdogThread();
+void InstallCrashReporter();
 
 } // namespace
 
@@ -195,7 +197,10 @@ void SetCurrentThreadName(const char* name) noexcept {
 
 void NotifyProgress() noexcept {
 	g_progress.fetch_add(1, std::memory_order_relaxed);
-	std::call_once(g_start_once, [] { std::thread(WatchdogThread).detach(); });
+	std::call_once(g_start_once, [] {
+		InstallCrashReporter();
+		std::thread(WatchdogThread).detach();
+	});
 }
 
 void SetGauge(Gauge gauge, uint64_t value) noexcept {
@@ -897,6 +902,105 @@ void ReportThreadSamplesBounded(std::string& out) {
 	}
 }
 
+// Last-chance report for host crashes that would otherwise end the process without a message:
+// exception code, faulting address, the crashing thread's guest name and activities, and its
+// stack (frame-pointer chain plus code addresses found on the stack).
+std::string CrashThreadSummary() {
+	std::string out;
+	if (t_slot != nullptr) {
+		out += fmt::format("thread: guest=\"{}\"\n", t_slot->thread_name);
+		const auto depth = std::min(t_slot->activity_depth.load(std::memory_order_relaxed),
+		                            Slot::MaxActivities);
+		for (uint32_t i = 0; i < depth; i++) {
+			const auto& e = t_slot->activities[i];
+			out += fmt::format("  activity [{}] {} arg0=0x{:x} arg1=0x{:x}\n", i,
+			                   e.what != nullptr ? e.what : "?", e.arg0, e.arg1);
+		}
+	}
+	return out;
+}
+
+std::string DescribeCrashStack(const CONTEXT& context) {
+	const auto modules    = HostModules();
+	auto&      symbolizer = SharedSymbolizer();
+	const auto read       = [](uint64_t addr, uint64_t* value) {
+		SIZE_T done = 0;
+		return (addr & 7u) == 0u &&
+		       ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(addr), value,
+		                         sizeof(*value), &done) != 0 &&
+		       done == sizeof(*value);
+	};
+	std::string out = fmt::format("     #0  {}\n", DescribeAddress(context.Rip, modules, &symbolizer));
+	uint64_t    fp  = context.Rbp;
+	for (int i = 1; i < 32; i++) {
+		uint64_t next = 0;
+		uint64_t ret  = 0;
+		if (!read(fp, &next) || !read(fp + 8, &ret) || ret == 0) break;
+		out += fmt::format("     #{:<2} {}\n", i, DescribeAddress(ret, modules, &symbolizer));
+		if (next <= fp) break;
+		fp = next;
+	}
+	int listed = 0;
+	for (uint64_t offset = 0; offset < 0x4000 && listed < 40; offset += 8) {
+		uint64_t value = 0;
+		if (!read(context.Rsp + offset, &value)) break;
+		if (FindModule(modules, value) != nullptr) {
+			out += fmt::format("     scan +0x{:<5x} {}\n", offset,
+			                   DescribeAddress(value, modules, &symbolizer));
+			listed++;
+		}
+	}
+	return out;
+}
+
+void WriteCrashReport(const std::string& text) {
+	std::fwrite(text.data(), 1, text.size(), stdout);
+	std::fflush(stdout);
+	if (auto* file = std::fopen("kyty_crash.txt", "ab"); file != nullptr) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
+
+std::atomic_flag g_crash_reported = ATOMIC_FLAG_INIT;
+
+LONG WINAPI CrashFilter(EXCEPTION_POINTERS* pointers) {
+	if (g_crash_reported.test_and_set()) return EXCEPTION_CONTINUE_SEARCH;
+	const auto* record = pointers->ExceptionRecord;
+	std::string out    = fmt::format(
+        "\n=== Kyty crash: host exception 0x{:08x} at 0x{:x} (host thread {}) ===\n",
+        static_cast<uint32_t>(record->ExceptionCode),
+        reinterpret_cast<uint64_t>(record->ExceptionAddress), GetCurrentThreadId());
+	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+		const auto kind = record->ExceptionInformation[0];
+		out += fmt::format("access violation: {} of address 0x{:x}\n",
+		                   kind == 0 ? "read" : kind == 1 ? "write" : kind == 8 ? "execute" : "access",
+		                   record->ExceptionInformation[1]);
+	}
+	out += CrashThreadSummary();
+	out += DescribeCrashStack(*pointers->ContextRecord);
+	out += "=== end of crash report ===\n";
+	WriteCrashReport(out);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void AbortHandler(int /*signal*/) {
+	if (g_crash_reported.test_and_set()) return;
+	CONTEXT context {};
+	RtlCaptureContext(&context);
+	std::string out = fmt::format("\n=== Kyty crash: abort() called (host thread {}) ===\n",
+	                              GetCurrentThreadId());
+	out += CrashThreadSummary();
+	out += DescribeCrashStack(context);
+	out += "=== end of crash report ===\n";
+	WriteCrashReport(out);
+}
+
+void InstallCrashReporter() {
+	SetUnhandledExceptionFilter(CrashFilter);
+	std::signal(SIGABRT, AbortHandler);
+}
+
 #else
 
 void ReportThreadSamplesBounded(std::string& out) {
@@ -906,6 +1010,8 @@ void ReportThreadSamplesBounded(std::string& out) {
 void ProfileBusyThreads(std::string& out, int /*duration_ms*/) {
 	out += "Profiling is only implemented on Windows\n";
 }
+
+void InstallCrashReporter() {}
 
 #endif
 
