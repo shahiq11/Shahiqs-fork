@@ -481,6 +481,41 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// CFG::MayWriteScalarRegister also reports the SGPR after any scalar destination because not
+// every 64-bit destination width is decoded. Call-target checks need the exact SGPRs: scalar ALU
+// destinations are 64-bit only for *_B64/_U64/_I64 results, SMEM loads have decoded widths, and
+// VALU scalar destinations (compare masks, carries) are lane masks of the wave size.
+bool WritesScalarRegister(const Decoder::Instruction& inst, uint32_t reg, uint32_t wave_size) {
+	if (!CFG::MayWriteScalarRegister(inst, reg)) return false;
+	if (inst.dst.kind != Decoder::OperandKind::Sgpr || inst.dst.reg == reg || inst.dst.reg + 1u != reg)
+		return true;
+	using Family = Decoder::Family;
+	const std::string_view name = magic_enum::enum_name(inst.opcode);
+	switch (inst.family) {
+		case Family::SMEM: return inst.data_dwords > 1u;
+		case Family::SOP1:
+		case Family::SOP2:
+		case Family::SOPK:
+		case Family::SOPC: {
+			// The first type suffix names the destination (S_BCNT1_I32_B64 writes 32 bits).
+			for (size_t at = name.find('_'); at != std::string_view::npos; at = name.find('_', at + 1u)) {
+				const auto token = name.substr(at + 1u, 3u);
+				if (token == "B32" || token == "U32" || token == "I32") return false;
+				if (token == "B64" || token == "U64" || token == "I64") return true;
+			}
+			return true;
+		}
+		case Family::VOP1:
+		case Family::VOP2:
+		case Family::VOP3:
+		case Family::VOP3P:
+		case Family::VOPC:
+			if (name.starts_with("V_READFIRSTLANE") || name.starts_with("V_READLANE")) return false;
+			return wave_size == 64u;
+		default: return true;
+	}
+}
+
 void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	std::vector<uint32_t> calls;
@@ -490,7 +525,8 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		calls.push_back(i);
 	}
 	EXIT_IF(calls.empty());
-	source.call = ShaderSource::Call {.instruction = calls.front()};
+	source.call      = ShaderSource::Call {.instruction = calls.front()};
+	source.wave_size = options.wave_size;
 	// Several calls (possibly of different helpers): each call loads its target with S_MOV_B32
 	// from an SGPR pair in the straight-line code before it. With forward branches only, the
 	// pair still holds its entry (user data) value when no earlier caller instruction writes it;
@@ -520,7 +556,7 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 					const auto& inst = instructions[--i];
 					if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || Decoder::IsDirectBranch(inst.opcode))
 						break;
-					if (CFG::MayWriteScalarRegister(inst, reg)) {
+					if (WritesScalarRegister(inst, reg, options.wave_size)) {
 						if (inst.opcode == Decoder::Opcode::S_MOV_B32 &&
 						    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg == reg &&
 						    inst.src0.kind == Decoder::OperandKind::Sgpr) {
@@ -533,7 +569,7 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 				EXIT_NOT_IMPLEMENTED(mov == UINT32_MAX);
 				sources[half] = instructions[mov].src0.reg;
 				for (uint32_t i = 0; i < mov; ++i) {
-					EXIT_NOT_IMPLEMENTED(CFG::MayWriteScalarRegister(instructions[i], sources[half]));
+					EXIT_NOT_IMPLEMENTED(WritesScalarRegister(instructions[i], sources[half], options.wave_size));
 				}
 				EXIT_NOT_IMPLEMENTED(sources[half] < options.user_data_base ||
 				                     sources[half] - options.user_data_base >= options.user_data.size());
@@ -760,10 +796,10 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 			EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
 			                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
 			                     inst.opcode == Decoder::Opcode::S_ENDPGM);
-			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
-			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+			EXIT_NOT_IMPLEMENTED(WritesScalarRegister(inst, call.dst.reg, source.wave_size) ||
+			                     WritesScalarRegister(inst, call.dst.reg + 1u, source.wave_size));
 			for (const auto reg: source.call_source_registers) {
-				EXIT_NOT_IMPLEMENTED(CFG::MayWriteScalarRegister(inst, reg));
+				EXIT_NOT_IMPLEMENTED(WritesScalarRegister(inst, reg, source.wave_size));
 			}
 			const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
 			if (returns) {

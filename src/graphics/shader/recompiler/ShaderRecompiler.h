@@ -61,6 +61,7 @@ struct ShaderSource {
 	std::vector<Call> extra_calls;
 	// SGPRs that hold helper addresses for repeated calls; no helper may write them.
 	std::vector<uint32_t> call_source_registers;
+	uint32_t              wave_size = 64;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
