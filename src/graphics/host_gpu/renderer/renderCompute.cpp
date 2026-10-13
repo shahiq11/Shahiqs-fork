@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/debugFlags.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -431,10 +432,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	const auto crumb = GpuBreadcrumbs::Begin(vk_buffer, "dispatch", program.shader_hash, 0,
-	                                         thread_group_x, thread_group_y, thread_group_z);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
-	GpuBreadcrumbs::End(vk_buffer, crumb);
+	if (!DebugFlags::SkipShader(program.shader_hash)) {
+		const auto crumb = GpuBreadcrumbs::Begin(vk_buffer, "dispatch", program.shader_hash, 0,
+		                                         thread_group_x, thread_group_y, thread_group_z);
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		GpuBreadcrumbs::End(vk_buffer, crumb);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -496,10 +499,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	const auto crumb =
-	    GpuBreadcrumbs::Begin(vk_buffer, "dispatch-i", program.shader_hash);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	GpuBreadcrumbs::End(vk_buffer, crumb);
+	if (!DebugFlags::SkipShader(program.shader_hash)) {
+		const auto crumb = GpuBreadcrumbs::Begin(vk_buffer, "dispatch-i", program.shader_hash);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		GpuBreadcrumbs::End(vk_buffer, crumb);
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

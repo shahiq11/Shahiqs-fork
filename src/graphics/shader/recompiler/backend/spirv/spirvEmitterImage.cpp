@@ -689,8 +689,13 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	    image.indirect_resources.size() < 2u) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}
-	const auto selected = EmitIndirectResourceIndex(
+	const auto mapped = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	// A descriptor array index past the bound descriptors faults the GPU (device loss), so a
+	// mapping entry outside the table falls back to the root (null) candidate.
+	const auto in_table = Binary(state, spv::OpULessThan, TypeBool(state), mapped,
+	                             ConstantU32(state, static_cast<uint32_t>(image.indirect_resources.size())));
+	const auto selected = Select(state, TypeU32(state), in_table, mapped, ConstantU32(state, 0u));
 	if (image.indirect_search_iterations == 0u && state.fault_buffer_variable != 0u &&
 	    IR::ImageResidency::Enabled() &&
 	    image.indirect_mapping_offset >= IR::ImageResidencyHeaderWords) {

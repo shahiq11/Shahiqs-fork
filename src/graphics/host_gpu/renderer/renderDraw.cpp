@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/debugFlags.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 
 #include "common/assert.h"
@@ -1211,16 +1212,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	const auto crumb = GpuBreadcrumbs::Begin(
-	    vk_buffer, mesh_active ? "draw-mesh" : "draw", state.vertex_info[0].stage.program->shader_hash,
-	    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0, draw.index_count,
-	    draw.instance_count, static_cast<uint32_t>(vertex_stages.size()));
-	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	const auto ps_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0u;
+	bool       skip    = ps_hash != 0u && DebugFlags::SkipShader(ps_hash);
+	for (const auto& stage: vertex_stages) {
+		skip = skip || DebugFlags::SkipShader(stage.stage.program->shader_hash);
 	}
-	GpuBreadcrumbs::End(vk_buffer, crumb);
+	if (!skip) {
+		const auto crumb = GpuBreadcrumbs::Begin(
+		    vk_buffer, mesh_active ? "draw-mesh" : "draw",
+		    state.vertex_info[0].stage.program->shader_hash, ps_hash, draw.index_count,
+		    draw.instance_count, static_cast<uint32_t>(vertex_stages.size()));
+		if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		}
+		GpuBreadcrumbs::End(vk_buffer, crumb);
+	}
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

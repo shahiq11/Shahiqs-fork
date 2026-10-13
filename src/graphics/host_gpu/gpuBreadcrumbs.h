@@ -16,7 +16,7 @@ struct GraphicContext;
 namespace GpuBreadcrumbs {
 
 [[nodiscard]] const char* ExtensionName() noexcept;
-void                      Init(GraphicContext& graphics, bool extension_enabled);
+void Init(GraphicContext& graphics, bool extension_enabled, bool device_fault_enabled);
 
 // Returns the command id to pass to End (0 when breadcrumbs are off).
 [[nodiscard]] uint32_t Begin(vk::CommandBuffer command, const char* kind, uint64_t hash0,

@@ -143,10 +143,26 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
-	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 0));
-	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 1));
+	// Guest allocation requests are 10/11-bit fields. Counts above the declared maximum, or
+	// primitives that index past the allocated vertices, are undefined behavior that can hang or
+	// fault the host GPU, so clamp the counts and cull such primitives.
+	const auto& mesh_info = state.input_info.vertex->mesh;
+	const auto  vertices  = EmitUMin32(
+        state,
+        MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup, TypeU32(state),
+	             ConstantU32(state, 0)),
+        ConstantU32(state, mesh_info.max_vertices));
+	const auto requested_primitives = EmitUMin32(
+	    state,
+	    MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup, TypeU32(state),
+	             ConstantU32(state, 1)),
+	    ConstantU32(state, mesh_info.max_primitives));
+	const auto no_vertices = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), no_vertices, vertices,
+	                          ConstantU32(state, 0));
+	const auto primitives = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), primitives, no_vertices,
+	                          ConstantU32(state, 0), requested_primitives);
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -183,11 +199,29 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, half));
 			uint32_t   vertex[3] {};
+			uint32_t   out_of_range = 0;
 			for (uint32_t component = 0; component < 3; component++) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
 				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+				const auto outside = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), outside,
+				                          vertex[component], vertices);
+				if (out_of_range == 0) {
+					out_of_range = outside;
+				} else {
+					const auto any = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), any, out_of_range,
+					                          outside);
+					out_of_range = any;
+				}
+			}
+			for (uint32_t component = 0; component < 3; component++) {
+				const auto safe = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeU32(state), safe, out_of_range,
+				                          ConstantU32(state, 0), vertex[component]);
+				vertex[component] = safe;
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
@@ -198,9 +232,12 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			state.builder.AddFunction(spv::OpStore, triangle_pointer, triangle);
 			const auto null_bit =
 			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
-			const auto culled = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), culled, null_bit,
+			const auto null_primitive = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), null_primitive, null_bit,
 			                          ConstantU32(state, 0));
+			const auto culled = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), culled, null_primitive,
+			                          out_of_range);
 			state.builder.AddFunction(spv::OpStore,
 			                          MeshElement(state, state.mesh_cull, spv::StorageClassOutput,
 			                                      TypeBool(state), index),

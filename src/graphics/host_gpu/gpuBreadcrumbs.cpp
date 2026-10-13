@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "kernel/hangWatchdog.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cinttypes>
@@ -12,6 +13,7 @@
 #include <fmt/format.h>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace Libs::Graphics::GpuBreadcrumbs {
 
@@ -31,6 +33,8 @@ constexpr uint32_t RingSize = 1u << 16u;
 
 struct State {
 	bool                        enabled    = false;
+	bool                        device_fault = false;
+	vk::Device                  device     = nullptr;
 	vk::Buffer                  buffer     = nullptr;
 	VmaAllocation               allocation = nullptr;
 	volatile uint32_t*          mapped     = nullptr;
@@ -51,8 +55,10 @@ const char* ExtensionName() noexcept {
 	return VK_AMD_BUFFER_MARKER_EXTENSION_NAME;
 }
 
-void Init(GraphicContext& graphics, bool extension_enabled) {
+void Init(GraphicContext& graphics, bool extension_enabled, bool device_fault_enabled) {
 	auto& state = GetState();
+	state.device       = graphics.device;
+	state.device_fault = device_fault_enabled;
 	if (!extension_enabled || graphics.allocator == nullptr) {
 		std::printf("GPU crash breadcrumbs: unavailable (no %s)\n", ExtensionName());
 		return;
@@ -145,6 +151,35 @@ void ReportDeviceLost() {
 		}
 		if (last - first > 48u) {
 			text += fmt::format("  ... {} more running commands\n", last - first - 47u);
+		}
+	}
+	if (state.device_fault && state.device) {
+		vk::DeviceFaultCountsEXT counts {};
+		if (state.device.getFaultInfoEXT(&counts, nullptr) == vk::Result::eSuccess ||
+		    counts.addressInfoCount != 0u || counts.vendorInfoCount != 0u) {
+			std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+			std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+			vk::DeviceFaultInfoEXT info {};
+			info.pAddressInfos      = addresses.data();
+			info.pVendorInfos       = vendors.data();
+			counts.vendorBinarySize = 0;
+			const auto result       = state.device.getFaultInfoEXT(&counts, &info);
+			text += fmt::format("GPU fault info ({}): {}\n", vk::to_string(result),
+			                    std::string(info.description.data()));
+			for (uint32_t index = 0; index < counts.addressInfoCount; ++index) {
+				const auto& address = addresses[index];
+				text += fmt::format("  address {}: 0x{:016x} (+-0x{:x})\n",
+				                    vk::to_string(address.addressType), address.reportedAddress,
+				                    address.addressPrecision);
+			}
+			for (uint32_t index = 0; index < counts.vendorInfoCount; ++index) {
+				const auto& vendor = vendors[index];
+				text += fmt::format("  vendor: {} code=0x{:x} data=0x{:x}\n",
+				                    std::string(vendor.description.data()), vendor.vendorFaultCode,
+				                    vendor.vendorFaultData);
+			}
+		} else {
+			text += "GPU fault info: unavailable\n";
 		}
 	}
 	Log::WriteToConsoleAndLog(text);

@@ -658,6 +658,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
+	// Device-loss diagnostics (fault addresses), see GpuBreadcrumbs.
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		device_fault.deviceFault = VK_TRUE;
+		device_fault.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext        = &device_fault;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1040,6 +1047,9 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, GpuBreadcrumbs::ExtensionName())) {
 			device_extensions.push_back(GpuBreadcrumbs::ExtensionName());
 		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1059,7 +1069,8 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 	GpuBreadcrumbs::Init(graphic_ctx,
-	                     HasExtension(device_extensions, GpuBreadcrumbs::ExtensionName()));
+	                     HasExtension(device_extensions, GpuBreadcrumbs::ExtensionName()),
+	                     HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME));
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
