@@ -211,9 +211,14 @@ void Translator::S_INST_PREFETCH() {
 }
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
-	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
-	const auto address = IR::U64(
-	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	// A linked call returns through a resolved CFG edge, so SWAPPC's return address is never
+	// jumped to; keep it a plain value instead of a native PC (shader base + offset).
+	const auto address =
+	    inst.opcode == Decoder::Opcode::S_SWAPPC_B64
+	        ? IR::U64(IR::Value(static_cast<uint64_t>(inst.pc) + 4u))
+	        : IR::U64(ir.Emit(IR::ValueOpcode::IAdd64,
+	                          {IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase)),
+	                           IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}

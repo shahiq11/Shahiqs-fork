@@ -1091,12 +1091,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	if (decoded.has_swap_pc) {
-		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
-		for (const auto* block: ir.blocks)
-			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
-	}
+	// Linked programs: helper returns are resolved CFG edges and SWAPPC writes no native PC (see
+	// S_GETPC_B64). Helpers may not use S_GETPC_B64, so remaining shader-base values come from the
+	// caller, whose instructions keep their native PCs.
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
 	if (options.dump_ir) {
