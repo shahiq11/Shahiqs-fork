@@ -410,6 +410,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.reserve(code.size());
 	program.code = code;
 	program.has_swap_pc = false;
+	program.indirect_calls.clear();
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {

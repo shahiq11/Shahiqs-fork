@@ -114,6 +114,8 @@ struct Graph {
 
 Graph       BuildGraph(const Decoder::Program& program);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+// The function-table call record of the S_SWAPPC_B64 at `pc`, if any.
+const Decoder::IndirectCall* FindIndirectCall(const Decoder::Program& program, uint32_t pc);
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                               uint32_t before, uint32_t code);
 // Returns structured control flow or failure diagnostics without changing the native graph.

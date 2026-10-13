@@ -1468,6 +1468,20 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
+		if (inst.opcode == Opcode::S_SWAPPC_B64) {
+			for (const auto& call: program.indirect_calls) {
+				if (call.pc != inst.pc) continue;
+				for (const auto& [value, target]: call.cases) {
+					(void)value;
+					if (!IsValidTarget(target, program.instructions, end_pc)) {
+						ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+						                 fmt::format("call at pc 0x{:08x} targets invalid pc 0x{:08x}",
+						                             inst.pc, target));
+					}
+					labels.push_back(target);
+				}
+			}
+		}
 		if (Decoder::IsDirectBranch(inst.opcode) ||
 		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
@@ -1551,6 +1565,17 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto  next_pc = InstructionEndPc(last);
 		if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind = TerminatorKind::Return;
+		} else if (const auto* indirect_call =
+		               last.opcode == Opcode::S_SWAPPC_B64 ? FindIndirectCall(program, last.pc) : nullptr;
+		           indirect_call != nullptr) {
+			// A function-table call selects its inlined helper by the target address.
+			block.terminator.kind             = TerminatorKind::IndirectBranch;
+			block.terminator.condition        = BranchCondition::Always;
+			block.terminator.indirect_pc_sgpr = indirect_call->selector_sgpr;
+			for (const auto& [value, target]: indirect_call->cases) {
+				block.terminator.indirect_target_pcs.push_back(value);
+				block.terminator.indirect_targets.push_back(block_at_pc(target));
+			}
 		} else if (last.opcode == Opcode::S_SWAPPC_B64 && last.branch_target != UINT32_MAX) {
 			block.terminator.kind = TerminatorKind::Branch;
 			block.terminator.true_block = block_at_pc(last.branch_target);
@@ -1678,6 +1703,13 @@ Graph Structurize(const Graph& graph) {
 		return failed;
 	}
 	return GotoStructurizer(graph).Run();
+}
+
+const Decoder::IndirectCall* FindIndirectCall(const Decoder::Program& program, uint32_t pc) {
+	for (const auto& call: program.indirect_calls) {
+		if (call.pc == pc) return &call;
+	}
+	return nullptr;
 }
 
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {

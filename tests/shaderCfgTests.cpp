@@ -10491,6 +10491,73 @@ void TestRepeatedVectorHelperCalls() {
 #endif
 }
 
+void TestFunctionTableCall() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe00c0000ull;
+  // The helper address comes from a 16-byte function-table entry selected at run time
+  // (s_buffer_load_dwordx4 s[8:11], s[4:7], s20). Every distinct table entry gets a copy and
+  // the call branches to the copy whose address matches s8.
+  const uint32_t shader[] = {0xf4280202u, 0x28000000u, EncodeSMovB32(14, 8), EncodeSMovB32(15, 9),
+                             0xbe8e210eu, EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 24> words{};
+  } memory;
+  const auto helper_a = base + 0x40u;
+  const auto helper_b = base + 0x50u;
+  for (const auto [entry, target] : {std::pair{0u, helper_a}, std::pair{1u, helper_b}, std::pair{2u, helper_a}}) {
+    memory.words[entry * 4u] = static_cast<uint32_t>(target);
+    memory.words[entry * 4u + 1u] = static_cast<uint32_t>(target >> 32u);
+  }
+  memory.words[16] = EncodeVop1(0x01, 1, 256);
+  memory.words[17] = EncodeSop1(0x21, 125, 14);
+  memory.words[20] = EncodeVop1(0x01, 2, 256);
+  memory.words[21] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void* data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const auto end = base + 0x60u;
+    if (address < base || address > end || out.size_bytes() > end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[4] = static_cast<uint32_t>(base);
+  user_data[5] = static_cast<uint32_t>(base >> 32u) & 0xffffu;
+  user_data[6] = 48; // three 16-byte entries
+  user_data[7] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.call && source.call->table && source.call->selector_sgpr == 8u &&
+            source.call->entry_bytes == 16u && source.call->target_offset == 0,
+        "function-table call was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(linked.instructions.size() == 9u && linked.instructions[3].branch_target == 0x18u &&
+            linked.indirect_calls.size() == 1u && linked.indirect_calls[0].pc == 0x10u &&
+            linked.indirect_calls[0].selector_sgpr == 8u &&
+            linked.indirect_calls[0].cases ==
+                std::vector<std::pair<uint32_t, uint32_t>>{{static_cast<uint32_t>(helper_a), 0x18u},
+                                                           {static_cast<uint32_t>(helper_b), 0x20u}} &&
+            linked.instructions[6].branch_target == 0x14u && linked.instructions[8].branch_target == 0x14u,
+        "function-table call was not linked to one copy per table entry");
+  const auto graph = CFG::BuildGraph(linked);
+  Check(std::ranges::any_of(graph.blocks, [](const auto& block) {
+          return block.terminator.kind == CFG::TerminatorKind::IndirectBranch &&
+                 block.terminator.indirect_targets.size() == 2u;
+        }),
+        "function-table call did not become an indirect branch");
+  (void)TranslateProgram(linked, options);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "unchanged function table was relinked");
+  memory.words[0] = static_cast<uint32_t>(helper_b); // entry 0 now calls B, so B comes first
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->indirect_calls[0].cases.size() == 2u &&
+            source.linked->indirect_calls[0].cases[0].first == static_cast<uint32_t>(helper_b),
+        "changed function table was not relinked");
+}
+
 void TestMemoryFedScalarLeafCall() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -15748,6 +15815,7 @@ int main() {
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestRepeatedVectorHelperCalls();
+  TestFunctionTableCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

@@ -6,6 +6,7 @@
 #include <magic_enum.hpp>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
@@ -854,10 +855,19 @@ struct Instruction {
 	std::string_view unsupported_reason;
 };
 
+// A linked S_SWAPPC_B64 whose helper is chosen at run time from a function table: the call
+// branches to the inlined helper copy whose address low 32 bits (in `selector_sgpr`) match.
+struct IndirectCall {
+	uint32_t                                   pc            = 0;
+	uint32_t                                   selector_sgpr = 0;
+	std::vector<std::pair<uint32_t, uint32_t>> cases; // (address low 32 bits, copy PC)
+};
+
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
+	std::vector<IndirectCall> indirect_calls;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

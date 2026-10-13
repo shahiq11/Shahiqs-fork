@@ -45,6 +45,14 @@ struct ShaderSource {
 	struct Call {
 		uint32_t instruction;
 		std::array<IR::Value, 2> target;
+		// Function-table call: the helper address is read on the GPU from a table entry chosen
+		// at run time. The host enumerates the table (V# `table_descriptor`, `entry_bytes` per
+		// entry, address at `target_offset`) and the call selects a copy by `selector_sgpr`.
+		bool                     table         = false;
+		uint32_t                 selector_sgpr = UINT32_MAX;
+		std::array<IR::Value, 4> table_descriptor {};
+		uint32_t                 entry_bytes   = 0;
+		int64_t                  target_offset = 0;
 	};
 	struct Linked {
 		std::vector<uint32_t> code;
@@ -52,6 +60,8 @@ struct ShaderSource {
 		std::vector<uint32_t> observed_function;
 		// Distinct helper addresses and their word counts, in code order.
 		std::vector<std::pair<uint64_t, uint32_t>> helpers;
+		// Raw target values per call (several for function-table calls).
+		std::vector<std::vector<uint64_t>> call_targets;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
