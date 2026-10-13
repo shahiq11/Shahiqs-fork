@@ -46,6 +46,11 @@ private:
 uint32_t CurrentActivityDepth() noexcept;
 void     RestoreActivityDepth(uint32_t depth) noexcept;
 
+// Describes a code address (host module+symbol or guest module+offset) and the code addresses
+// found on the current thread's stack, for reports of quiet process exits.
+std::string DescribeCodeAddress(uint64_t address);
+std::string CurrentStackSummary();
+
 // Appends a line to a diagnostics file in the working directory (thread safe).
 void AppendDiagnostic(const char* file_name, const std::string& text);
 

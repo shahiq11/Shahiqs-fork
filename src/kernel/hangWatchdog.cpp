@@ -996,6 +996,31 @@ void AbortHandler(int /*signal*/) {
 	WriteCrashReport(out);
 }
 
+std::string CurrentStackSummaryImpl() {
+	CONTEXT context {};
+	RtlCaptureContext(&context);
+	const auto modules    = HostModules();
+	auto&      symbolizer = SharedSymbolizer();
+	std::string out;
+	int         listed = 0;
+	for (uint64_t offset = 0; offset < 0x8000 && listed < 40; offset += 8) {
+		uint64_t value = 0;
+		SIZE_T   done  = 0;
+		if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(context.Rsp + offset),
+		                      &value, sizeof(value), &done) == 0 || done != sizeof(value))
+			break;
+		bool  busy  = false;
+		auto* rt    = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		const bool guest = rt->TryFindProgramByAddr(value, &busy) != nullptr;
+		if (FindModule(modules, value) != nullptr || guest) {
+			out += fmt::format("     scan +0x{:<5x} {}\n", offset,
+			                   DescribeAddress(value, modules, &symbolizer));
+			listed++;
+		}
+	}
+	return out;
+}
+
 void InstallCrashReporter() {
 	SetUnhandledExceptionFilter(CrashFilter);
 	std::signal(SIGABRT, AbortHandler);
@@ -1012,6 +1037,10 @@ void ProfileBusyThreads(std::string& out, int /*duration_ms*/) {
 }
 
 void InstallCrashReporter() {}
+
+std::string CurrentStackSummaryImpl() {
+	return {};
+}
 
 #endif
 
@@ -1111,5 +1140,17 @@ void WatchdogThread() {
 }
 
 } // namespace
+
+std::string DescribeCodeAddress(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return DescribeAddress(address, HostModules(), &SharedSymbolizer());
+#else
+	return DescribeGuestAddress(address);
+#endif
+}
+
+std::string CurrentStackSummary() {
+	return CurrentStackSummaryImpl();
+}
 
 } // namespace Kernel::HangWatchdog

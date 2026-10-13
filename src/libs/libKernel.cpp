@@ -1692,7 +1692,14 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
-
+	// The game ending itself is otherwise silent: say who asked.
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	const auto text   = fmt::format("\n=== Guest called exit({}) from {} ===\n{}", code,
+	                                Kernel::HangWatchdog::DescribeCodeAddress(caller),
+	                                Kernel::HangWatchdog::CurrentStackSummary());
+	std::printf("%s", text.c_str());
+	std::fflush(stdout);
+	Kernel::HangWatchdog::AppendDiagnostic("kyty_crash.txt", text);
 	::exit(code);
 }
 

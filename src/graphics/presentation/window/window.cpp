@@ -26,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <cstdlib>
+#include <cstdio>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -166,12 +167,16 @@ static void SetPause(WindowLoopState& game, bool flag) {
 
 static void GameEventQuit(WindowLoopState& game) {
 	LOGF("Event: quit\n");
+	std::printf("\n=== Window: quit requested (window closed) ===\n");
+	std::fflush(stdout);
 
 	game.need_exit = true;
 }
 
 static void GameEventTerminate(WindowLoopState& game) {
 	LOGF("Event: terminate\n");
+	std::printf("\n=== Window: terminate requested by the OS ===\n");
+	std::fflush(stdout);
 
 	game.need_exit = true;
 }

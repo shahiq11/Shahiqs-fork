@@ -5,6 +5,7 @@
 #include "libs/errno.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -57,6 +58,8 @@ int LoadExec(const char* path, const char* const argv[]) {
 		arguments.emplace_back(argv[i], size - 1);
 	}
 	LOGF("LoadExec: %s\n", path);
+	std::printf("\n=== Guest LoadExec: restarting as %s ===\n", path);
+	std::fflush(stdout);
 	Log::Flush();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	wchar_t    executable[32768] {};
