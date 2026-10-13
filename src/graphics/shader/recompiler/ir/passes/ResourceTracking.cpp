@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <fmt/format.h>
 #include <array>
@@ -20,6 +21,14 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+std::atomic<bool> g_untraceable_images_as_null {false};
+} // namespace
+
+void SetUntraceableImagesAsNull(bool enabled) noexcept {
+	g_untraceable_images_as_null.store(enabled, std::memory_order_relaxed);
+}
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -2317,6 +2326,33 @@ private:
 					if (warned.size() < 1024 && warned.insert(m_program.shader_hash).second) {
 						std::printf("Note: shader %016llx pc=0x%08x selects its sampler on the GPU; "
 						            "using a default trilinear wrap sampler\n",
+						            static_cast<unsigned long long>(m_program.shader_hash), pc);
+					}
+				}
+				source = InternSource(descriptor);
+				return true;
+			}
+			if (expected == ValueOpcode::GetImageResource && !sampler &&
+			    g_untraceable_images_as_null.load(std::memory_order_relaxed)) {
+				// The T# comes from data the host cannot follow (for example a texture chosen by
+				// a GPU-selected function). Read through a null texture (zeros, writes dropped)
+				// instead of losing the whole shader: its other work still runs.
+				descriptor             = {};
+				descriptor.dword_count = width;
+				for (uint32_t i = 0; i < width; ++i) {
+					descriptor.dwords[i] = Value(0u);
+					handle->SetArg(i, Value(0u));
+				}
+				for (auto& entry: m_resolved_handles) {
+					if (entry.handle == handle) entry.source = descriptor;
+				}
+				static std::mutex                   mutex;
+				static std::unordered_set<uint64_t> warned;
+				{
+					std::scoped_lock lock(mutex);
+					if (warned.size() < 1024 && warned.insert(m_program.shader_hash).second) {
+						std::printf("Note: shader %016llx pc=0x%08x selects a texture the host cannot "
+						            "follow; reading a null texture there\n",
 						            static_cast<unsigned long long>(m_program.shader_hash), pc);
 					}
 				}

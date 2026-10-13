@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/debugFlags.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -46,6 +47,8 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                     "Texture Residency Readback");
 	// Load broad-heap textures on demand. Set before any shader resource is materialized.
 	IR::ImageResidency::SetEnabled(!DebugFlags::Has("no_texture_residency"));
+	// Untraceable textures read as null instead of losing their shader.
+	IR::SetUntraceableImagesAsNull(!DebugFlags::Has("strict_resource_tracking"));
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
