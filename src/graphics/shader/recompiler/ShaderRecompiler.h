@@ -50,15 +50,17 @@ struct ShaderSource {
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
 		std::vector<uint32_t> observed_function;
+		// Distinct helper addresses and their word counts, in code order.
+		std::vector<std::pair<uint64_t, uint32_t>> helpers;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
 	std::optional<Call> call;
-	// Later calls of the same helper (see PrepareCallTarget); each is linked to its own copy.
-	std::vector<uint32_t> extra_calls;
-	// SGPRs that hold the helper address for every call; the helper must not write them.
-	std::array<uint32_t, 2> call_source_registers {UINT32_MAX, UINT32_MAX};
+	// Later calls (see PrepareCallTarget); each call is linked to its own copy of its helper.
+	std::vector<Call> extra_calls;
+	// SGPRs that hold helper addresses for repeated calls; no helper may write them.
+	std::vector<uint32_t> call_source_registers;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

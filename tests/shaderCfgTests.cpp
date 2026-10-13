@@ -10431,20 +10431,24 @@ void TestGraphicsComputeGetreg() {
 void TestRepeatedVectorHelperCalls() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0080000ull;
-  // Two calls of one helper whose address is in user data s[8:9]; the helper uses VALU and
-  // returns through s[14:15]. Each call gets its own copy returning to its own continuation.
+  // Two calls of helper A (address in user data s[8:9]) and one of helper B (s[12:13]). The
+  // helpers use VALU and return through s[14:15]; each call gets its own copy that returns to
+  // its own continuation. The caller may reuse s8 after its last call through it.
   const uint32_t shader[] = {
       EncodeSMovB32(14, 8), EncodeSMovB32(15, 9), 0xbe8e210eu,
       EncodeSMovB32(14, 8), EncodeSMovB32(15, 9), 0xbe8e210eu,
+      EncodeSMovB32(14, 12), EncodeSMovB32(15, 13), EncodeSMovB32(8, 128), 0xbe8e210eu,
       EncodeSopp(0x01)};
   struct Memory {
     std::array<uint32_t, 8> words{};
   } memory;
   memory.words[0] = EncodeVop1(0x01, 1, 256); // v_mov_b32 v1, v0
   memory.words[1] = EncodeSop1(0x21, 125, 14); // return
+  memory.words[4] = EncodeVop1(0x01, 2, 256); // v_mov_b32 v2, v0
+  memory.words[5] = EncodeSop1(0x21, 125, 14);
   const auto read = [](void* data, uint64_t address, std::span<uint32_t> out) {
     const auto& m = *static_cast<Memory*>(data);
-    const auto end = base + 8u;
+    const auto end = base + 0x18u;
     if (address < base || address > end || out.size_bytes() > end - address) return false;
     std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
                 out.size_bytes());
@@ -10453,31 +10457,37 @@ void TestRepeatedVectorHelperCalls() {
   std::array<uint32_t, 64> user_data{};
   user_data[8] = static_cast<uint32_t>(base);
   user_data[9] = static_cast<uint32_t>(base >> 32u);
+  user_data[12] = static_cast<uint32_t>(base + 0x10u);
+  user_data[13] = static_cast<uint32_t>(base >> 32u);
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
                          .read_specialization_memory = read};
   auto source = PrepareShaderSource(shader, options);
-  Check(source.call && source.extra_calls.size() == 1u && source.extra_calls[0] == 5u &&
-            source.call_source_registers == std::array<uint32_t, 2>{8u, 9u},
+  Check(source.call && source.extra_calls.size() == 2u &&
+            source.extra_calls[0].instruction == 5u && source.extra_calls[1].instruction == 9u &&
+            source.call_source_registers == std::vector<uint32_t>{8u, 9u, 12u, 13u},
         "repeated helper calls were not recognized");
   const auto& linked = RefreshShaderSource(source, runtime);
-  Check(linked.instructions.size() == 11u && linked.instructions[2].branch_target == 0x1cu &&
-            linked.instructions[5].branch_target == 0x24u &&
-            linked.instructions[7].opcode == Decoder::Opcode::S_BRANCH &&
-            linked.instructions[7].branch_target == 0x0cu &&
-            linked.instructions[9].pc == 0x24u &&
-            linked.instructions[10].branch_target == 0x18u &&
-            source.reads.back() == std::pair<uint64_t, uint64_t>{base, 8},
+  const auto& code = linked.instructions;
+  Check(code.size() == 17u && code[2].branch_target == 0x2cu && code[5].branch_target == 0x34u &&
+            code[9].branch_target == 0x3cu && code[12].opcode == Decoder::Opcode::S_BRANCH &&
+            code[12].branch_target == 0x0cu && code[14].branch_target == 0x18u &&
+            code[15].pc == 0x3cu && code[15].raw[0] == EncodeVop1(0x01, 2, 256) && code[16].branch_target == 0x28u &&
+            source.reads.size() >= 2u &&
+            source.reads[source.reads.size() - 2u] == std::pair<uint64_t, uint64_t>{base, 8} &&
+            source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x10u, 8},
         "repeated helper calls were not linked to separate copies");
   (void)TranslateProgram(linked, options);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "unchanged helpers were relinked");
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  // A helper that overwrites the address registers would change later call targets.
-  memory.words[0] = EncodeSMovB32(8, 128);
+  // A helper that overwrites an address register would change later call targets.
+  memory.words[0] = EncodeSMovB32(12, 128);
   auto clobbered = PrepareShaderSource(shader, options);
   ExpectFatal([&] { (void)RefreshShaderSource(clobbered, runtime); },
-              "helper that writes the call address registers was linked");
+              "helper that writes a call address register was linked");
 #endif
 }
 

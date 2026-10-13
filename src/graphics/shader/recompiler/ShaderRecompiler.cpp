@@ -491,24 +491,32 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	}
 	EXIT_IF(calls.empty());
 	source.call = ShaderSource::Call {.instruction = calls.front()};
+	// Several calls (possibly of different helpers): each call loads its target with S_MOV_B32
+	// from an SGPR pair in the straight-line code before it. With forward branches only, the
+	// pair still holds its entry (user data) value when no earlier caller instruction writes it;
+	// linking checks that no helper writes such a register either.
+	std::vector<std::array<uint32_t, 2>> call_sources;
 	if (calls.size() > 1u) {
-		// Repeated calls of one helper: every call loads its target with S_MOV_B32 from the
-		// same SGPR pair, which neither the caller nor (checked when linking) the helper writes.
-		// Each call then reaches the first call's target and gets its own inlined copy.
 		const auto& instructions = source.decoded.instructions;
 		std::vector<bool> labels(instructions.size(), false);
-		for (const auto& inst: instructions) {
+		for (uint32_t i = 0; i < instructions.size(); ++i) {
+			const auto& inst = instructions[i];
 			if (!Decoder::IsDirectBranch(inst.opcode)) continue;
-			for (uint32_t i = 0; i < instructions.size(); ++i) {
-				if (instructions[i].pc == inst.branch_target) labels[i] = true;
+			EXIT_NOT_IMPLEMENTED(inst.branch_target <= inst.pc); // a loop could rerun earlier code
+			for (uint32_t j = 0; j < instructions.size(); ++j) {
+				if (instructions[j].pc == inst.branch_target) labels[j] = true;
 			}
 		}
-		const auto target_sources = [&](uint32_t call_index) {
-			const auto& call_inst = instructions[call_index];
+		for (const auto index: calls) {
+			const auto& call_inst = instructions[index];
+			EXIT_NOT_IMPLEMENTED(call_inst.src0.kind != Decoder::OperandKind::Sgpr ||
+			                     call_inst.dst.kind != Decoder::OperandKind::Sgpr ||
+			                     call_inst.src0.reg != call_inst.dst.reg);
 			std::array<uint32_t, 2> sources {UINT32_MAX, UINT32_MAX};
 			for (uint32_t half = 0; half < 2u; ++half) {
 				const auto reg = call_inst.src0.reg + half;
-				for (uint32_t i = call_index; i > 0u;) {
+				uint32_t   mov = UINT32_MAX;
+				for (uint32_t i = index; i > 0u;) {
 					const auto& inst = instructions[--i];
 					if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || Decoder::IsDirectBranch(inst.opcode))
 						break;
@@ -516,32 +524,27 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 						if (inst.opcode == Decoder::Opcode::S_MOV_B32 &&
 						    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg == reg &&
 						    inst.src0.kind == Decoder::OperandKind::Sgpr) {
-							sources[half] = inst.src0.reg;
+							mov = i;
 						}
 						break;
 					}
 					if (labels[i]) break;
 				}
+				EXIT_NOT_IMPLEMENTED(mov == UINT32_MAX);
+				sources[half] = instructions[mov].src0.reg;
+				for (uint32_t i = 0; i < mov; ++i) {
+					EXIT_NOT_IMPLEMENTED(CFG::MayWriteScalarRegister(instructions[i], sources[half]));
+				}
+				EXIT_NOT_IMPLEMENTED(sources[half] < options.user_data_base ||
+				                     sources[half] - options.user_data_base >= options.user_data.size());
 			}
-			return sources;
-		};
-		const auto first_sources = target_sources(calls.front());
-		const auto& first_call   = instructions[calls.front()];
-		EXIT_NOT_IMPLEMENTED(first_sources[0] == UINT32_MAX || first_sources[1] == UINT32_MAX);
-		for (const auto index: std::span(calls).subspan(1)) {
-			const auto& inst = instructions[index];
-			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
-			                     inst.dst.kind != Decoder::OperandKind::Sgpr ||
-			                     inst.src0.reg != first_call.src0.reg ||
-			                     inst.dst.reg != first_call.dst.reg ||
-			                     target_sources(index) != first_sources);
-			source.extra_calls.push_back(index);
+			call_sources.push_back(sources);
+			if (index != calls.front()) source.extra_calls.push_back({.instruction = index});
+			for (const auto reg: sources) {
+				if (std::ranges::find(source.call_source_registers, reg) == source.call_source_registers.end())
+					source.call_source_registers.push_back(reg);
+			}
 		}
-		for (const auto& inst: instructions) {
-			EXIT_NOT_IMPLEMENTED(CFG::MayWriteScalarRegister(inst, first_sources[0]) ||
-			                     CFG::MayWriteScalarRegister(inst, first_sources[1]));
-		}
-		source.call_source_registers = first_sources;
 	}
 	EXIT_IF(options.input_info.compute == nullptr);
 	const auto& call = source.decoded.instructions[source.call->instruction];
@@ -612,18 +615,27 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		EXIT_IF(!producer.ready || !producer.values.contains(code));
 		return producer.values.at(code).Resolve();
 	};
-	for (uint32_t i = 0; i < 2u; ++i) {
-		const auto value = Register(source.call->instruction, call.src0.reg + i);
-		EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
-		auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
-		root.SetArg(0, value);
-		source.call->target[i] = Value(&root);
+	std::vector<ShaderSource::Call*> linked_calls {&*source.call};
+	for (auto& extra: source.extra_calls) linked_calls.push_back(&extra);
+	for (size_t index = 0; index < linked_calls.size(); ++index) {
+		for (uint32_t i = 0; i < 2u; ++i) {
+			// A single call follows its reaching definitions; repeated calls read entry values.
+			const auto value = call_sources.empty()
+			                       ? Register(source.call->instruction, call.src0.reg + i)
+			                       : Register(0u, call_sources[index][i]);
+			EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
+			root.SetArg(0, value);
+			linked_calls[index]->target[i] = Value(&root);
+		}
 	}
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
 	RemoveIdentities(query.blocks);
 	EliminateDeadCode(query.blocks);
-	for (auto& value: source.call->target) value = value.Instruction()->Arg(0).Resolve();
+	for (auto* linked_call: linked_calls) {
+		for (auto& value: linked_call->target) value = value.Instruction()->Arg(0).Resolve();
+	}
 	query.value_storage.clear();
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
@@ -663,19 +675,45 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	IR::SrtReadCapture capture(runtime, reads);
 	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
 	IR::SrtWalker walker(source.call_targets, clean);
-	uint32_t low = 0, high = 0;
 	const auto& call = source.decoded.instructions[source.call->instruction];
-	if (!walker.Evaluate(source.call->target[0], low) || !walker.Evaluate(source.call->target[1], high))
-		EXIT("shader call at pc 0x%08x has an unavailable scalar target", call.pc);
-	// SWAPPC reads the old aliased pair and ignores the target's low two bits.
-	const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
-	EXIT_IF(address == 0u);
+	std::vector<const ShaderSource::Call*> calls {&*source.call};
+	for (const auto& extra: source.extra_calls) calls.push_back(&extra);
+	// Helper address per call, and the distinct helpers in first-call order.
+	std::vector<uint64_t> call_addresses;
+	std::vector<uint64_t> helper_addresses;
+	for (const auto* linked_call: calls) {
+		uint32_t low = 0, high = 0;
+		if (!walker.Evaluate(linked_call->target[0], low) || !walker.Evaluate(linked_call->target[1], high))
+			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
+			     source.decoded.instructions[linked_call->instruction].pc);
+		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
+		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
+		EXIT_IF(address == 0u);
+		call_addresses.push_back(address);
+		if (std::ranges::find(helper_addresses, address) == helper_addresses.end())
+			helper_addresses.push_back(address);
+	}
 	const auto query_reads = reads.size();
-	if (source.linked) {
+	if (source.linked && source.linked->helpers.size() == helper_addresses.size()) {
 		auto& linked = *source.linked;
 		const auto function = std::span(linked.code).subspan(source.code.size());
-		if (clean.read_memory(clean.userdata, address, linked.observed_function) &&
-		    std::ranges::equal(function, linked.observed_function)) {
+		bool       same     = function.size() == linked.observed_function.size();
+		size_t     offset   = 0;
+		for (size_t index = 0; same && index < helper_addresses.size(); ++index) {
+			const auto words    = linked.helpers[index].second;
+			const auto observed = std::span(linked.observed_function).subspan(offset, words);
+			same = clean.read_memory(clean.userdata, helper_addresses[index], observed) &&
+			       std::ranges::equal(function.subspan(offset, words), observed);
+			offset += words;
+		}
+		if (same) {
+			// Identical code may move; record where it was read this time.
+			reads.resize(query_reads);
+			for (size_t index = 0; index < helper_addresses.size(); ++index) {
+				reads.emplace_back(helper_addresses[index],
+				                   uint64_t {linked.helpers[index].second} * sizeof(uint32_t));
+				linked.helpers[index].first = helper_addresses[index];
+			}
 			return linked.decoded;
 		}
 		reads.resize(query_reads);
@@ -684,65 +722,73 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	                             .decoded = source.decoded};
 	const auto& last = source.decoded.instructions.back();
 	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
-	// Decode the helper once with helper-relative PCs. It ends at the S_SETPC_B64 return that no
-	// helper branch jumps past; earlier returns are allowed.
+	// Decode each helper once with helper-relative PCs. A helper ends at the S_SETPC_B64 return
+	// that no helper branch jumps past; earlier returns are allowed.
 	struct HelperInstruction {
 		Decoder::Instruction inst;
 		bool                 returns = false;
 	};
-	std::vector<HelperInstruction> helper;
-	constexpr uint32_t MaxHelperWords = 16384u;
-	uint32_t           furthest_target = 0;
-	for (uint32_t index = 0;;) {
-		EXIT_IF(index >= MaxHelperWords ||
-		        address > UINT64_MAX - (uint64_t {index} + Decoder::MaxInstructionRawWords) *
-		                                   sizeof(uint32_t));
-		std::array<uint32_t, Decoder::MaxInstructionRawWords> words {};
-		const auto word_address = address + uint64_t {index} * sizeof(uint32_t);
-		// Read as many words as are mapped (the helper may end next to unmapped memory).
-		size_t available = words.size();
-		while (available > 0u &&
-		       !clean.read_memory(clean.userdata, word_address, std::span(words).first(available))) {
-			--available;
+	std::vector<std::vector<HelperInstruction>> helpers;
+	for (const auto address: helper_addresses) {
+		auto& helper = helpers.emplace_back();
+		constexpr uint32_t MaxHelperWords = 16384u;
+		uint32_t           furthest_target = 0;
+		const auto         code_begin      = linked.code.size();
+		for (uint32_t index = 0;;) {
+			EXIT_IF(index >= MaxHelperWords ||
+			        address > UINT64_MAX - (uint64_t {index} + Decoder::MaxInstructionRawWords) *
+			                                   sizeof(uint32_t));
+			std::array<uint32_t, Decoder::MaxInstructionRawWords> words {};
+			const auto word_address = address + uint64_t {index} * sizeof(uint32_t);
+			// Read as many words as are mapped (a helper may end next to unmapped memory).
+			size_t available = words.size();
+			while (available > 0u &&
+			       !clean.read_memory(clean.userdata, word_address, std::span(words).first(available))) {
+				--available;
+			}
+			if (available == 0u) EXIT("shader call at pc 0x%08x cannot read helper code", call.pc);
+			Decoder::Instruction inst;
+			Decoder::DecodeInstruction(words, 0u, inst);
+			EXIT_IF(inst.word_count > available);
+			inst.pc = index * sizeof(uint32_t);
+			if (Decoder::IsDirectBranch(inst.opcode)) {
+				inst.branch_target += inst.pc;
+				furthest_target = std::max(furthest_target, inst.branch_target);
+			}
+			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
+			index += inst.word_count;
+			EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+			                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+			                     inst.opcode == Decoder::Opcode::S_ENDPGM);
+			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
+			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+			for (const auto reg: source.call_source_registers) {
+				EXIT_NOT_IMPLEMENTED(CFG::MayWriteScalarRegister(inst, reg));
+			}
+			const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
+			if (returns) {
+				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
+				                     inst.src0.reg != call.dst.reg);
+			}
+			helper.push_back({std::move(inst), returns});
+			if (returns && furthest_target < index * sizeof(uint32_t)) break;
 		}
-		if (available == 0u) EXIT("shader call at pc 0x%08x cannot read helper code", call.pc);
-		Decoder::Instruction inst;
-		Decoder::DecodeInstruction(words, 0u, inst);
-		EXIT_IF(inst.word_count > available);
-		inst.pc = index * sizeof(uint32_t);
-		if (Decoder::IsDirectBranch(inst.opcode)) {
-			inst.branch_target += inst.pc;
-			furthest_target = std::max(furthest_target, inst.branch_target);
+		const auto size = helper.back().inst.pc + helper.back().inst.word_count * sizeof(uint32_t);
+		for (const auto& entry: helper) {
+			if (!entry.returns && Decoder::IsDirectBranch(entry.inst.opcode))
+				EXIT_IF(entry.inst.branch_target >= size);
 		}
-		linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
-		index += inst.word_count;
-		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-		                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-		                     inst.opcode == Decoder::Opcode::S_ENDPGM);
-		EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) || CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
-		for (const auto reg: source.call_source_registers) {
-			EXIT_NOT_IMPLEMENTED(reg != UINT32_MAX && CFG::MayWriteScalarRegister(inst, reg));
-		}
-		const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
-		if (returns) {
-			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
-		}
-		helper.push_back({std::move(inst), returns});
-		if (returns && furthest_target < index * sizeof(uint32_t)) break;
+		linked.helpers.emplace_back(address, static_cast<uint32_t>(linked.code.size() - code_begin));
 	}
-	const auto helper_size = helper.back().inst.pc + helper.back().inst.word_count * sizeof(uint32_t);
-	for (const auto& entry: helper) {
-		if (!entry.returns && Decoder::IsDirectBranch(entry.inst.opcode))
-			EXIT_IF(entry.inst.branch_target >= helper_size);
-	}
-	// Keep the caller's data/footer bytes at their native offsets. Each call's copy of the helper
-	// gets virtual CFG PCs after the decoded instructions; its physical code is read and owned once.
-	std::vector<uint32_t> call_instructions {source.call->instruction};
-	call_instructions.insert(call_instructions.end(), source.extra_calls.begin(),
-	                         source.extra_calls.end());
+	// Keep the caller's data/footer bytes at their native offsets. Each call's copy of its helper
+	// gets virtual CFG PCs after the decoded instructions; helper code is read and owned once.
 	auto function_pc = last.pc + last.word_count * sizeof(uint32_t);
-	for (const auto call_index: call_instructions) {
-		auto& call_inst = linked.decoded.instructions[call_index];
+	for (size_t index = 0; index < calls.size(); ++index) {
+		const auto helper_index = static_cast<size_t>(
+		    std::ranges::find(helper_addresses, call_addresses[index]) - helper_addresses.begin());
+		const auto& helper      = helpers[helper_index];
+		const auto  helper_size = helper.back().inst.pc + helper.back().inst.word_count * sizeof(uint32_t);
+		auto& call_inst = linked.decoded.instructions[calls[index]->instruction];
 		EXIT_IF(function_pc > UINT32_MAX - helper_size);
 		const auto return_pc = call_inst.pc + call_inst.word_count * sizeof(uint32_t);
 		call_inst.branch_target = function_pc;
@@ -760,7 +806,9 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		function_pc += helper_size;
 	}
 	reads.resize(query_reads);
-	reads.emplace_back(address, (linked.code.size() - source.code.size()) * sizeof(uint32_t));
+	for (const auto& [address, words]: linked.helpers) {
+		reads.emplace_back(address, uint64_t {words} * sizeof(uint32_t));
+	}
 	linked.decoded.code = linked.code;
 	linked.observed_function.resize(linked.code.size() - source.code.size());
 	source.linked = std::move(linked);
