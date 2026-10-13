@@ -10553,8 +10553,8 @@ void TestFunctionTableCall() {
   Check(source.revision == 1, "unchanged function table was relinked");
   memory.words[0] = static_cast<uint32_t>(helper_b); // entry 0 now calls B, so B comes first
   (void)RefreshShaderSource(source, runtime);
-  Check(source.revision == 2 && source.linked->indirect_calls[0].cases.size() == 2u &&
-            source.linked->indirect_calls[0].cases[0].first == static_cast<uint32_t>(helper_b),
+  Check(source.revision == 2 && source.linked->decoded.indirect_calls[0].cases.size() == 2u &&
+            source.linked->decoded.indirect_calls[0].cases[0].first == static_cast<uint32_t>(helper_b),
         "changed function table was not relinked");
 }
 

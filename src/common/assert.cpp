@@ -15,20 +15,39 @@ namespace Common {
 
 namespace {
 
+// Builds with C++ exceptions (the Windows /EHsc build) unwind recoverable errors with an
+// exception, so destructors run and Windows' stack unwinder is never asked to longjmp through
+// frames with cleanups. Builds without exceptions jump back with longjmp.
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+constexpr bool RecoverWithExceptions = true;
+#else
+constexpr bool RecoverWithExceptions = false;
+#endif
+
 struct RecoveryPoint {
 	std::jmp_buf   buffer {};
 	std::string    message;
 	RecoveryPoint* previous = nullptr;
 };
 
+struct RecoverableError {
+	std::string message;
+};
+
 thread_local RecoveryPoint* t_recovery = nullptr;
 
 // Reports a fatal error raised inside RunRecoverable and returns to it.
 [[noreturn]] void Recover(const char* title, std::string_view text, const char* file, int line) {
-	auto* point    = t_recovery;
+	auto* point   = t_recovery;
+	auto  message = fmt::format("{} {} ({}:{})", title, text, file, line);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+	(void)point;
+	throw RecoverableError {std::move(message)};
+#else
 	t_recovery     = point->previous;
-	point->message = fmt::format("{} {} ({}:{})", title, text, file, line);
+	point->message = std::move(message);
 	std::longjmp(point->buffer, 1);
+#endif
 }
 
 } // namespace
@@ -36,6 +55,20 @@ thread_local RecoveryPoint* t_recovery = nullptr;
 bool RunRecoverable(void (*function)(void*), void* context, std::string* error) {
 	RecoveryPoint point;
 	point.previous = t_recovery;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+	static_assert(RecoverWithExceptions);
+	t_recovery = &point;
+	try {
+		function(context);
+	} catch (RecoverableError& recovered) {
+		t_recovery = point.previous;
+		if (error != nullptr) *error = std::move(recovered.message);
+		return false;
+	}
+	t_recovery = point.previous;
+	return true;
+#else
+	static_assert(!RecoverWithExceptions);
 	if (setjmp(point.buffer) != 0) {
 		// Recover() already restored the enclosing recovery point.
 		if (error != nullptr) *error = point.message;
@@ -45,6 +78,7 @@ bool RunRecoverable(void (*function)(void*), void* context, std::string* error) 
 	function(context);
 	t_recovery = point.previous;
 	return true;
+#endif
 }
 
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
